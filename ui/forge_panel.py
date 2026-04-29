@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import ast
 import base64
+import json
+from pathlib import Path
 
-from PyQt6.QtCore import QMimeData, QPoint, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QDrag, QPixmap
+from PyQt6.QtCore import QMimeData, QPoint, QRect, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor, QDrag, QFont, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -20,15 +23,23 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QPushButton,
     QSplitter,
     QScrollArea,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
+    QTabWidget,
     QToolButton,
     QTextEdit,
     QVBoxLayout,
     QSpinBox,
     QWidget,
 )
+
+
+UI_STATE_PATH = Path("configs/ui_state.json")
 
 
 def _label_text(value: object) -> str:
@@ -63,23 +74,134 @@ def _short_label(text: str, limit: int = 18) -> str:
     return text[: max(0, limit - 3)].rstrip() + "..."
 
 
+def _label_prefix(name: str) -> str:
+    for sep in ("_", "-", " ", "."):
+        if sep in name:
+            return name.split(sep, 1)[0].lower()
+    return name[:1].lower() or "·"
+
+
+class ColorChipDelegate(QStyledItemDelegate):
+    """Paints a colored dot next to the label text instead of using item background."""
+
+    DOT_RADIUS = 6
+    DOT_PADDING = 10
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._header_font = QFont()
+        self._header_font.setBold(True)
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # noqa: D401
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+
+        is_header = bool(index.data(Qt.ItemDataRole.UserRole + 1))
+        if is_header:
+            painter.save()
+            painter.fillRect(option.rect, QColor("#0d1016"))
+            painter.setFont(self._header_font)
+            painter.setPen(QPen(QColor("#9fb2c8")))
+            text_rect = option.rect.adjusted(10, 0, -6, 0)
+            painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), index.data())
+            painter.restore()
+            return
+
+        data = index.data(Qt.ItemDataRole.UserRole)
+        color_hex = ""
+        if isinstance(data, dict):
+            color_hex = str(data.get("color", "")).strip()
+
+        widget = option.widget
+        style = widget.style() if widget else None
+        opt.text = ""
+        if style is not None:
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+        else:
+            painter.fillRect(option.rect, opt.backgroundBrush)
+
+        rect: QRect = option.rect
+        cx = rect.left() + self.DOT_PADDING
+        cy = rect.center().y()
+
+        if color_hex:
+            color = QColor(color_hex)
+            if not color.isValid():
+                color = QColor("#7a8392")
+        else:
+            color = QColor("#3a4452")
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(QBrush(color))
+        painter.setPen(QPen(QColor("#0a0c10"), 1))
+        painter.drawEllipse(QPoint(cx, cy), self.DOT_RADIUS, self.DOT_RADIUS)
+        painter.restore()
+
+        text = index.data() or ""
+        text_rect = rect.adjusted(self.DOT_PADDING * 2 + self.DOT_RADIUS, 0, -8, 0)
+        painter.save()
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.setPen(QPen(QColor("#ffffff")))
+        else:
+            painter.setPen(QPen(QColor("#e6eaf2")))
+        painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), text)
+        painter.restore()
+
+    def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:  # noqa: N802
+        size = super().sizeHint(option, index)
+        is_header = bool(index.data(Qt.ItemDataRole.UserRole + 1))
+        size.setHeight(28 if is_header else 26)
+        return size
+
+
 class DragListWidget(QListWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setDragEnabled(True)
         self.setDragDropMode(QListWidget.DragDropMode.DragOnly)
+        self.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+
+    def _selectable_items(self) -> list[QListWidgetItem]:
+        items = [item for item in self.selectedItems() if not item.data(Qt.ItemDataRole.UserRole + 1)]
+        if items:
+            return items
+        current = self.currentItem()
+        if current and not current.data(Qt.ItemDataRole.UserRole + 1):
+            return [current]
+        return []
 
     def startDrag(self, supportedActions):  # noqa: N802
-        items = self.selectedItems()
+        items = self._selectable_items()
         if not items:
-            item = self.currentItem()
-            items = [item] if item else []
-        labels = [_label_text(item.data(Qt.ItemDataRole.UserRole) or item.text()) for item in items if item]
+            return
+        labels = [_label_text(item.data(Qt.ItemDataRole.UserRole) or item.text()) for item in items]
+        labels = [label for label in labels if label.strip()]
+        if not labels:
+            return
         mime = QMimeData()
-        mime.setText("\n".join(label for label in labels if label.strip()))
+        mime.setText("\n".join(labels))
         drag = QDrag(self)
         drag.setMimeData(mime)
+        drag.setPixmap(self._build_drag_pixmap(len(labels), labels[0]))
+        drag.setHotSpot(QPoint(20, 16))
         drag.exec(supportedActions)
+
+    @staticmethod
+    def _build_drag_pixmap(count: int, sample: str) -> QPixmap:
+        text = f"{count} labels" if count > 1 else _short_label(sample, 24)
+        width = max(120, 16 + len(text) * 7)
+        pixmap = QPixmap(width, 32)
+        pixmap.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(QBrush(QColor("#243043")))
+        painter.setPen(QPen(QColor("#4d6b8a"), 1))
+        painter.drawRoundedRect(0, 0, width - 1, 31, 8, 8)
+        painter.setPen(QPen(QColor("#e6eaf2")))
+        painter.drawText(pixmap.rect(), int(Qt.AlignmentFlag.AlignCenter), text)
+        painter.end()
+        return pixmap
 
 
 class CameraListWidget(QListWidget):
@@ -179,9 +301,9 @@ class CollapsibleSection(QWidget):
         self.header.setStyleSheet(
             """
             QToolButton {
-                padding: 10px 12px;
+                padding: 8px 10px;
                 border: 1px solid #2a313a;
-                border-radius: 10px;
+                border-radius: 8px;
                 background: #141820;
                 color: #e6eaf2;
                 font-weight: 600;
@@ -193,8 +315,8 @@ class CollapsibleSection(QWidget):
 
         self.content = QWidget()
         self.content_layout = QVBoxLayout(self.content)
-        self.content_layout.setContentsMargins(6, 6, 6, 6)
-        self.content_layout.setSpacing(8)
+        self.content_layout.setContentsMargins(4, 4, 4, 4)
+        self.content_layout.setSpacing(6)
 
         layout.addWidget(self.header)
         layout.addWidget(self.content)
@@ -236,22 +358,32 @@ class LabelPreviewCard(QFrame):
 
         self.image = QLabel()
         self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image.setMinimumHeight(110)
+        self.image.setMinimumHeight(96)
         self.image.setStyleSheet("background:#0f1115; border-radius:6px; color:#8b95a1;")
 
         crop = str(data.get("preview_base64", "")).strip()
         pixmap = QPixmap()
         if crop and pixmap.loadFromData(base64.b64decode(crop)):
-            self.image.setPixmap(pixmap.scaled(220, 110, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            self.image.setPixmap(pixmap.scaled(220, 96, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         else:
             self.image.setText("No crop")
 
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(6)
+        color_dot = QLabel()
+        color_dot.setFixedSize(10, 10)
+        color = str(data.get("color", "")).strip() or "#3a4452"
+        color_dot.setStyleSheet(f"background:{color}; border-radius:5px; border:1px solid #0a0c10;")
         self.title = QLabel(str(data.get("name", "")))
         self.title.setStyleSheet("font-weight: 600;")
-        self.subtitle = QLabel(f"{data.get('type', '')}")
+        title_row.addWidget(color_dot)
+        title_row.addWidget(self.title, 1)
+
+        self.subtitle = QLabel(str(data.get("type", "") or ""))
         self.subtitle.setStyleSheet("color:#9fb2c8; font-size: 11px;")
         layout.addWidget(self.image)
-        layout.addWidget(self.title)
+        layout.addLayout(title_row)
         layout.addWidget(self.subtitle)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
@@ -262,17 +394,21 @@ class LabelPreviewCard(QFrame):
 class LabelGalleryWidget(QWidget):
     selected = pyqtSignal(dict)
 
+    COLUMNS = 3
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._items: list[dict[str, object]] = []
         self._cards: list[LabelPreviewCard] = []
         self._filter_text = ""
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.content = QWidget()
         self.grid = QGridLayout(self.content)
-        self.grid.setSpacing(10)
+        self.grid.setSpacing(8)
+        self.grid.setContentsMargins(4, 4, 4, 4)
         self.scroll.setWidget(self.content)
         layout.addWidget(self.scroll)
 
@@ -291,11 +427,11 @@ class LabelGalleryWidget(QWidget):
                 child.widget().deleteLater()
         self._cards.clear()
         visible_items = [item for item in self._items if self._matches(item)]
-        for index, item in enumerate(visible_items[:24]):
+        for index, item in enumerate(visible_items):
             card = LabelPreviewCard(item)
             card.clicked.connect(self.selected.emit)
             self._cards.append(card)
-            self.grid.addWidget(card, index // 2, index % 2)
+            self.grid.addWidget(card, index // self.COLUMNS, index % self.COLUMNS)
         if visible_items:
             self.selected.emit(visible_items[0])
 
@@ -402,14 +538,28 @@ class ForgePanel(QWidget):
     label_selected = pyqtSignal(dict)
     camera_labels_dropped = pyqtSignal(int, list)
     gpio_labels_dropped = pyqtSignal(str, list)
+    bulk_clear_requested = pyqtSignal(list)
+
+    FILTER_ALL = "all"
+    FILTER_NO_CAMERA = "no_camera"
+    FILTER_NO_GPIO = "no_gpio"
+    FILTER_ASSIGNED = "assigned"
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._label_source: list[str | dict] = []
+        self._camera_for_label: dict[str, list[str]] = {}
+        self._gpio_for_label: dict[str, str] = {}
+        self._filter_mode: str = self.FILTER_ALL
+        self._group_mode: str = "none"
         self._build_ui()
+        self._install_shortcuts()
+        self._restore_state()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
 
         self.base_url = QLineEdit("https://forge.iinia.ai/api/swagger/")
         self.username = QLineEdit()
@@ -422,29 +572,36 @@ class ForgePanel(QWidget):
         self.connect_button = QPushButton("Conectar Forge")
         self.refresh_button = QPushButton("Refrescar Forge")
         self.connect_button.setToolTip("Abrir configuración Forge")
+        self.coverage_label = QLabel("0 labels · 0 cám · 0 gpio")
+        self.coverage_label.setStyleSheet(
+            "padding:4px 10px; border-radius:10px; background:#1b2028; color:#9fb2c8; font-weight:600;"
+        )
         actions.addWidget(self.connect_button)
         actions.addWidget(self.refresh_button)
+        actions.addStretch(1)
+        actions.addWidget(self.coverage_label)
 
         self.projects = QListWidget()
         self.cameras = CameraListWidget()
         self.lines = QListWidget()
         self.labels = DragListWidget()
-        self.labels.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        self.labels.setItemDelegate(ColorChipDelegate(self.labels))
+        self.labels.setUniformItemSizes(False)
         self.labels.itemClicked.connect(self._on_label_item_clicked)
         self.assigned = QListWidget()
         self.gpio_ports = PortListWidget()
         self.gpio_port = QComboBox()
         self.gpio_port.setEditable(True)
         self.gpio_port.addItems([f"GPIO{n}" for n in range(2, 28)])
-        for widget in (self.projects, self.cameras, self.lines, self.labels, self.assigned, self.gpio_ports):
-            widget.setSpacing(6)
+        for widget in (self.projects, self.cameras, self.lines, self.assigned, self.gpio_ports):
+            widget.setSpacing(4)
             widget.setStyleSheet(
                 """
                 QListWidget::item {
-                    margin: 3px;
-                    padding: 8px;
+                    margin: 2px;
+                    padding: 6px 8px;
                     border: 1px solid #2a313a;
-                    border-radius: 8px;
+                    border-radius: 6px;
                     background: #171a21;
                 }
                 QListWidget::item:selected {
@@ -453,6 +610,13 @@ class ForgePanel(QWidget):
                 }
                 """
             )
+        self.labels.setStyleSheet(
+            """
+            QListWidget { background:#10141b; border:1px solid #2a313a; border-radius:6px; }
+            QListWidget::item { padding: 0px; }
+            QListWidget::item:selected { background:#243043; }
+            """
+        )
 
         self.line_name = QLineEdit()
         self.line_name.setPlaceholderText("New line name")
@@ -462,7 +626,11 @@ class ForgePanel(QWidget):
 
         self.create_camera_button = QPushButton("Crear cámara")
         self.create_line_button = QPushButton("Crear línea")
-        self.assign_button = QPushButton("Asignar GPIO")
+        self.assign_button = QPushButton("Asignar a GPIO")
+        self.assign_button.setToolTip("Asigna las labels seleccionadas al puerto GPIO actual")
+        self.bulk_clear_button = QPushButton("Limpiar GPIO")
+        self.bulk_clear_button.setToolTip("Quita la asignación GPIO de las labels seleccionadas")
+        self.bulk_clear_button.clicked.connect(self._emit_bulk_clear)
         self.send_conf_button = QPushButton("Enviar conf a línea")
 
         self.preview_status = QTextEdit()
@@ -478,7 +646,7 @@ class ForgePanel(QWidget):
         self.label_gallery = LabelGalleryWidget()
         self.label_gallery.selected.connect(self._on_gallery_label_selected)
         self.label_search = QLineEdit()
-        self.label_search.setPlaceholderText("Buscar label, color o tipo")
+        self.label_search.setPlaceholderText("Buscar label, color o tipo  (presiona / para enfocar)")
         self.label_search.textChanged.connect(self.filter_label_views)
         self.label_detail = QLabel("Select a label to inspect")
         self.label_detail.setWordWrap(True)
@@ -498,10 +666,14 @@ class ForgePanel(QWidget):
         self.gpio_preview.setWordWrap(True)
         self.gpio_preview.setTextFormat(Qt.TextFormat.PlainText)
         self.gpio_preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.gpio_preview.setMaximumHeight(120)
+        self.gpio_preview.setMinimumHeight(120)
         self.gpio_preview.setStyleSheet("padding:8px; border:1px solid #2a313a; border-radius:8px; background:#111318; color:#d8dde3;")
 
         self.labels_hint = QLabel("0 labels")
+        self.labels_hint.setStyleSheet("color:#9fb2c8;")
+
+        self._build_filter_chips()
+        self._build_group_combo()
 
         self.project_section = CollapsibleSection("Projects", "Select a project", expanded=True)
         self.project_section.content_layout.addWidget(self.projects)
@@ -515,10 +687,20 @@ class ForgePanel(QWidget):
         self.line_section.content_layout.addWidget(self.line_name)
         self.line_section.content_layout.addWidget(self.create_line_button)
 
-        self.labels_section = CollapsibleSection("Labels", "Drag & drop source", expanded=True)
-        self.labels_section.content_layout.addWidget(self.component_filter)
-        self.labels_section.content_layout.addWidget(self.labels_hint)
-        self.labels_section.content_layout.addWidget(self.labels)
+        labels_box = QWidget(self)
+        labels_layout = QVBoxLayout(labels_box)
+        labels_layout.setContentsMargins(0, 0, 0, 0)
+        labels_layout.setSpacing(6)
+        header_row = QHBoxLayout()
+        header_row.addWidget(QLabel("Labels"))
+        header_row.addStretch(1)
+        header_row.addWidget(QLabel("Group:"))
+        header_row.addWidget(self.group_combo)
+        labels_layout.addLayout(header_row)
+        labels_layout.addLayout(self.filter_chip_layout)
+        labels_layout.addWidget(self.component_filter)
+        labels_layout.addWidget(self.labels_hint)
+        labels_layout.addWidget(self.labels, 1)
 
         self.projects.currentItemChanged.connect(
             lambda current, _previous: self._sync_compact_section(self.project_section, current, "Select a project")
@@ -532,55 +714,157 @@ class ForgePanel(QWidget):
 
         left_box = QWidget(self)
         left_layout = QVBoxLayout(left_box)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
         left_layout.addWidget(self.project_section)
         left_layout.addWidget(self.camera_section)
         left_layout.addWidget(self.line_section)
-        left_layout.addWidget(self.labels_section)
+        left_layout.addWidget(self.preview_status)
 
-        right_box = QWidget(self)
-        right_layout = QVBoxLayout(right_box)
-        right_layout.addWidget(QLabel("Assigned components"))
-        right_layout.addWidget(self.assigned)
-        right_layout.addWidget(QLabel("GPIO ports"))
-        right_layout.addWidget(self.gpio_ports)
-        right_layout.addWidget(self.gpio_preview)
-        right_layout.addWidget(self.label_search)
-        right_layout.addWidget(QLabel("Label gallery"))
-        right_layout.addWidget(self.label_gallery)
-        right_layout.addWidget(QLabel("Label detail"))
-        right_layout.addWidget(self.label_detail_image)
-        right_layout.addWidget(self.label_detail)
-        right_layout.addWidget(QLabel("Project preview"))
-        right_layout.addWidget(self.project_preview)
+        right_tabs = QTabWidget()
+        right_tabs.setTabPosition(QTabWidget.TabPosition.North)
 
-        left_scroll = QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        left_scroll.setWidget(left_box)
+        gpio_tab = QWidget()
+        gpio_layout = QVBoxLayout(gpio_tab)
+        gpio_layout.setContentsMargins(4, 4, 4, 4)
+        gpio_layout.setSpacing(6)
+        gpio_layout.addWidget(QLabel("Assigned components"))
+        gpio_layout.addWidget(self.assigned)
+        gpio_layout.addWidget(QLabel("GPIO ports"))
+        gpio_layout.addWidget(self.gpio_ports, 1)
+        gpio_layout.addWidget(QLabel("Resumen GPIO"))
+        gpio_layout.addWidget(self.gpio_preview)
 
-        right_scroll = QScrollArea()
-        right_scroll.setWidgetResizable(True)
-        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        right_scroll.setWidget(right_box)
+        gallery_tab = QWidget()
+        gallery_layout = QVBoxLayout(gallery_tab)
+        gallery_layout.setContentsMargins(4, 4, 4, 4)
+        gallery_layout.setSpacing(6)
+        gallery_layout.addWidget(self.label_search)
+        gallery_layout.addWidget(self.label_gallery, 1)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(left_scroll)
-        splitter.addWidget(right_scroll)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
+        detail_tab = QWidget()
+        detail_layout = QVBoxLayout(detail_tab)
+        detail_layout.setContentsMargins(4, 4, 4, 4)
+        detail_layout.setSpacing(6)
+        detail_layout.addWidget(self.label_detail_image)
+        detail_layout.addWidget(self.label_detail)
+        detail_layout.addWidget(QLabel("Project preview"))
+        detail_layout.addWidget(self.project_preview, 1)
+        detail_layout.addWidget(self.project_summary)
+
+        right_tabs.addTab(gpio_tab, "GPIO & Cámaras")
+        right_tabs.addTab(gallery_tab, "Galería")
+        right_tabs.addTab(detail_tab, "Detalle")
+        self.right_tabs = right_tabs
+
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.addWidget(left_box)
+        self.splitter.addWidget(labels_box)
+        self.splitter.addWidget(right_tabs)
+        self.splitter.setStretchFactor(0, 2)
+        self.splitter.setStretchFactor(1, 3)
+        self.splitter.setStretchFactor(2, 3)
+        self.splitter.setSizes([280, 380, 420])
 
         bottom = QHBoxLayout()
+        bottom.addWidget(QLabel("GPIO:"))
         bottom.addWidget(self.gpio_port)
         bottom.addWidget(self.assign_button)
+        bottom.addWidget(self.bulk_clear_button)
+        bottom.addStretch(1)
         bottom.addWidget(self.send_conf_button)
 
         root.addLayout(actions)
-        root.addWidget(splitter)
+        root.addWidget(self.splitter, 1)
         root.addLayout(bottom)
+
+    def _build_filter_chips(self) -> None:
+        self.filter_chip_layout = QHBoxLayout()
+        self.filter_chip_layout.setContentsMargins(0, 0, 0, 0)
+        self.filter_chip_layout.setSpacing(4)
+        self._filter_group = QButtonGroup(self)
+        self._filter_group.setExclusive(True)
+        self._filter_buttons: dict[str, QToolButton] = {}
+        chips = [
+            (self.FILTER_ALL, "Todos"),
+            (self.FILTER_NO_CAMERA, "Sin cámara"),
+            (self.FILTER_NO_GPIO, "Sin GPIO"),
+            (self.FILTER_ASSIGNED, "Asignados"),
+        ]
+        for mode, label in chips:
+            btn = QToolButton()
+            btn.setText(label)
+            btn.setCheckable(True)
+            btn.setAutoExclusive(False)
+            btn.setStyleSheet(
+                """
+                QToolButton {
+                    padding: 4px 10px;
+                    border: 1px solid #2a313a;
+                    border-radius: 12px;
+                    background: #141820;
+                    color: #cfd6e1;
+                }
+                QToolButton:checked {
+                    background: #243043;
+                    border-color: #4d6b8a;
+                    color: #ffffff;
+                }
+                QToolButton:hover { background: #1b2028; }
+                """
+            )
+            btn.clicked.connect(lambda _checked=False, m=mode: self._set_filter_mode(m))
+            self._filter_group.addButton(btn)
+            self._filter_buttons[mode] = btn
+            self.filter_chip_layout.addWidget(btn)
+        self.filter_chip_layout.addStretch(1)
+        self._filter_buttons[self.FILTER_ALL].setChecked(True)
+
+    def _build_group_combo(self) -> None:
+        self.group_combo = QComboBox()
+        self.group_combo.addItem("Sin agrupar", "none")
+        self.group_combo.addItem("Por prefijo", "prefix")
+        self.group_combo.addItem("Por tipo", "type")
+        self.group_combo.addItem("Por estado", "status")
+        self.group_combo.currentIndexChanged.connect(self._on_group_changed)
+
+    def _install_shortcuts(self) -> None:
+        focus_search = QShortcut(QKeySequence("/"), self)
+        focus_search.activated.connect(lambda: self.label_search.setFocus())
+        focus_search.setContext(Qt.ShortcutContext.WindowShortcut)
+
+        focus_filter = QShortcut(QKeySequence(Qt.Modifier.CTRL | Qt.Key.Key_F), self)
+        focus_filter.activated.connect(lambda: self.component_filter.setFocus())
+
+        clear = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        clear.activated.connect(self._clear_filters)
+
+        select_all = QShortcut(QKeySequence(Qt.Modifier.CTRL | Qt.Key.Key_A), self.labels)
+        select_all.activated.connect(self._select_all_visible_labels)
+        select_all.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+
+    def _clear_filters(self) -> None:
+        self.label_search.clear()
+        self.component_filter.clear()
+        self._set_filter_mode(self.FILTER_ALL)
+
+    def _select_all_visible_labels(self) -> None:
+        self.labels.clearSelection()
+        for i in range(self.labels.count()):
+            item = self.labels.item(i)
+            if item.isHidden() or item.data(Qt.ItemDataRole.UserRole + 1):
+                continue
+            item.setSelected(True)
+
+    def _set_filter_mode(self, mode: str) -> None:
+        self._filter_mode = mode
+        for key, btn in self._filter_buttons.items():
+            btn.setChecked(key == mode)
+        self.filter_label_views(self.label_search.text())
+
+    def _on_group_changed(self, _index: int) -> None:
+        self._group_mode = self.group_combo.currentData() or "none"
+        self.set_labels(self._label_source)
 
     def set_status(self, text: str) -> None:
         self.preview_status.setPlainText(text)
@@ -599,11 +883,18 @@ class ForgePanel(QWidget):
     def set_cameras(self, items: list[tuple[int, str, list[str]]]) -> None:
         self.cameras.clear()
         for camera_id, name, components in items:
-            suffix = f" [{', '.join(components)}]" if components else ""
+            count = len(components)
+            suffix = f"  ({count})" if count else ""
             item = QListWidgetItem(f"{camera_id}: {name}{suffix}")
             item.setData(Qt.ItemDataRole.UserRole, camera_id)
-            item.setToolTip(f"Drop labels here to assign to {name}")
-            item.setSizeHint(item.sizeHint() * 1.4)
+            tooltip = f"Drop labels here to assign to {name}"
+            if components:
+                preview = ", ".join(components[:8])
+                if len(components) > 8:
+                    preview += f" (+{len(components) - 8})"
+                tooltip += f"\nLabels: {preview}"
+            item.setToolTip(tooltip)
+            item.setSizeHint(item.sizeHint() * 1.3)
             self.cameras.addItem(item)
         self.camera_section.set_summary(f"{self.cameras.count()} cameras" if self.cameras.count() else "Select a camera")
 
@@ -616,53 +907,160 @@ class ForgePanel(QWidget):
             self.lines.addItem(item)
         self.line_section.set_summary(f"{self.lines.count()} lines" if self.lines.count() else "Select a line")
 
+    def _label_dict(self, label: object) -> dict:
+        if isinstance(label, dict):
+            data = dict(label)
+            data["name"] = str(data.get("name", "")).strip()
+            return data
+        text = str(label).strip()
+        return {"name": text, "type": "", "color": "", "preview_base64": ""}
+
     def set_labels(self, labels: list[str] | list[dict]) -> None:
+        previous_selected = {item.data(Qt.ItemDataRole.UserRole)["name"] for item in self.labels.selectedItems() if isinstance(item.data(Qt.ItemDataRole.UserRole), dict)}
         self._label_source = list(labels)
         self.labels.clear()
-        for label in labels:
-            if isinstance(label, dict):
-                name = str(label.get("name", "")).strip()
-                if not name:
-                    continue
-                item = QListWidgetItem(name)
-                item.setData(Qt.ItemDataRole.UserRole, label)
-                color = str(label.get("color", "")).strip()
-                if color:
-                    item.setBackground(QColor(color))
-                self.labels.addItem(item)
-            else:
-                text = str(label).strip()
-                if not text:
-                    continue
-                item = QListWidgetItem(text)
-                item.setData(Qt.ItemDataRole.UserRole, {"name": text, "type": "", "color": "", "preview_base64": ""})
-                self.labels.addItem(item)
-        self.labels_hint.setText(f"{self.labels.count()} labels (drag to cameras, YOLO-style projects often stay <= 80)")
-        self.labels_section.set_summary(f"{self.labels.count()} labels" if self.labels.count() else "Drag & drop source")
+        normalized = [self._label_dict(label) for label in labels if self._label_dict(label)["name"]]
+
+        groups = self._group_labels(normalized)
+        for header, members in groups:
+            if header:
+                head_item = QListWidgetItem(header)
+                head_item.setFlags(Qt.ItemFlag.NoItemFlags)
+                head_item.setData(Qt.ItemDataRole.UserRole + 1, True)
+                self.labels.addItem(head_item)
+            for data in members:
+                self._append_label_item(data, restore_selection=previous_selected)
+
+        self.labels_hint.setText(
+            f"{len(normalized)} labels (drag a cámaras/GPIO · Ctrl+A para todos los visibles · / para buscar)"
+        )
+        self._refresh_label_tooltips()
+        self._update_coverage()
         self.filter_label_views(self.label_search.text())
 
-    def filter_labels(self, text: str) -> None:
-        needle = text.strip().lower()
-        for i in range(self.labels.count()):
-            item = self.labels.item(i)
-            item.setHidden(bool(needle) and needle not in item.text().lower())
+    def _append_label_item(self, data: dict, *, restore_selection: set[str]) -> None:
+        name = data.get("name", "")
+        item = QListWidgetItem(name)
+        item.setData(Qt.ItemDataRole.UserRole, data)
+        if name in restore_selection:
+            item.setSelected(True)
+        self.labels.addItem(item)
 
-    def filter_label_views(self, text: str) -> None:
-        needle = text.strip().lower()
+    def _group_labels(self, labels: list[dict]) -> list[tuple[str, list[dict]]]:
+        if self._group_mode == "none" or not labels:
+            return [("", labels)]
+        buckets: dict[str, list[dict]] = {}
+        if self._group_mode == "prefix":
+            for data in labels:
+                key = _label_prefix(data.get("name", ""))
+                buckets.setdefault(key, []).append(data)
+        elif self._group_mode == "type":
+            for data in labels:
+                key = (str(data.get("type", "")).strip() or "—").lower()
+                buckets.setdefault(key, []).append(data)
+        elif self._group_mode == "status":
+            for data in labels:
+                name = data.get("name", "")
+                has_cam = bool(self._camera_for_label.get(name))
+                has_gpio = bool(self._gpio_for_label.get(name))
+                if has_cam and has_gpio:
+                    key = "asignados"
+                elif has_cam or has_gpio:
+                    key = "parciales"
+                else:
+                    key = "sin asignar"
+                buckets.setdefault(key, []).append(data)
+        else:
+            return [("", labels)]
+
+        ordered = sorted(buckets.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        return [(f"{key.upper()}  ({len(members)})", members) for key, members in ordered]
+
+    def _refresh_label_tooltips(self) -> None:
         for i in range(self.labels.count()):
             item = self.labels.item(i)
             data = item.data(Qt.ItemDataRole.UserRole)
-            if isinstance(data, dict):
-                haystack = " ".join(str(data.get(key, "")) for key in ("name", "type", "color")).lower()
+            if not isinstance(data, dict):
+                continue
+            name = data.get("name", "")
+            cam_list = self._camera_for_label.get(name, [])
+            gpio = self._gpio_for_label.get(name, "")
+            tooltip_lines = [f"<b>{name}</b>"]
+            if data.get("type"):
+                tooltip_lines.append(f"Tipo: {data.get('type')}")
+            if data.get("color"):
+                tooltip_lines.append(f"Color: {data.get('color')}")
+            if cam_list:
+                tooltip_lines.append("Cámaras: " + ", ".join(cam_list[:6]) + (f" (+{len(cam_list) - 6})" if len(cam_list) > 6 else ""))
             else:
-                haystack = item.text().lower()
-            item.setHidden(bool(needle) and needle not in haystack)
-        self.label_gallery.set_filter(text)
-        visible = [self.labels.item(i) for i in range(self.labels.count()) if not self.labels.item(i).isHidden()]
+                tooltip_lines.append("<i>Sin cámara asignada</i>")
+            if gpio:
+                tooltip_lines.append(f"GPIO: {gpio}")
+            else:
+                tooltip_lines.append("<i>Sin GPIO asignado</i>")
+            item.setToolTip("<br>".join(tooltip_lines))
+
+    def filter_labels(self, text: str) -> None:
+        self.filter_label_views(self.label_search.text() or text)
+
+    def filter_label_views(self, text: str) -> None:
+        needle = text.strip().lower()
+        component_needle = self.component_filter.text().strip().lower()
+        last_visible_index = -1
+        active_group_visible = False
+        group_indexes: list[int] = []
+
+        for i in range(self.labels.count()):
+            item = self.labels.item(i)
+            is_header = bool(item.data(Qt.ItemDataRole.UserRole + 1))
+            if is_header:
+                if last_visible_index >= 0 and not active_group_visible:
+                    self.labels.item(last_visible_index).setHidden(True)
+                last_visible_index = i
+                active_group_visible = False
+                group_indexes.append(i)
+                item.setHidden(False)
+                continue
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(data, dict):
+                item.setHidden(True)
+                continue
+            name = data.get("name", "")
+            haystack = " ".join(str(data.get(key, "")) for key in ("name", "type", "color")).lower()
+            text_match = (not needle or needle in haystack) and (not component_needle or component_needle in haystack)
+            mode_match = self._matches_filter_mode(name)
+            visible = text_match and mode_match
+            item.setHidden(not visible)
+            if visible:
+                active_group_visible = True
+
+        if last_visible_index >= 0 and not active_group_visible:
+            self.labels.item(last_visible_index).setHidden(True)
+
+        self.label_gallery.set_filter(needle or component_needle)
+        visible_items = [self.labels.item(i) for i in range(self.labels.count())
+                         if not self.labels.item(i).isHidden() and not self.labels.item(i).data(Qt.ItemDataRole.UserRole + 1)]
         current = self.labels.currentItem()
-        if visible and (current is None or current.isHidden()):
-            self.labels.setCurrentItem(visible[0])
-            self._on_label_item_clicked(visible[0])
+        if visible_items and (current is None or current.isHidden() or current.data(Qt.ItemDataRole.UserRole + 1)):
+            self.labels.setCurrentItem(visible_items[0])
+            self._on_label_item_clicked(visible_items[0])
+
+        self.labels_hint.setText(
+            f"{len(visible_items)} de {sum(1 for i in range(self.labels.count()) if not self.labels.item(i).data(Qt.ItemDataRole.UserRole + 1))} labels"
+        )
+
+    def _matches_filter_mode(self, name: str) -> bool:
+        if self._filter_mode == self.FILTER_ALL:
+            return True
+        has_cam = bool(self._camera_for_label.get(name))
+        has_gpio = bool(self._gpio_for_label.get(name))
+        if self._filter_mode == self.FILTER_NO_CAMERA:
+            return not has_cam
+        if self._filter_mode == self.FILTER_NO_GPIO:
+            return not has_gpio
+        if self._filter_mode == self.FILTER_ASSIGNED:
+            return has_cam and has_gpio
+        return True
 
     def _selection_summary(self, item: QListWidgetItem | None) -> str:
         if item is None:
@@ -701,28 +1099,60 @@ class ForgePanel(QWidget):
         self.gpio_ports.clear()
         for port in [f"GPIO{n}" for n in range(2, 28)]:
             labels = port_map.get(port, [])
-            suffix = f" - {', '.join(labels[:4])}" if labels else ""
-            if len(labels) > 4:
-                suffix += f" (+{len(labels) - 4})"
+            count = len(labels)
+            suffix = f"  ·  {count} labels" if count else "  ·  vacío"
             item = QListWidgetItem(f"{port}{suffix}")
             item.setData(Qt.ItemDataRole.UserRole, port)
-            item.setToolTip(f"Drop labels here to assign to {port}")
-            item.setSizeHint(item.sizeHint() * 1.35)
+            tooltip = f"Drop labels here to assign to {port}"
+            if labels:
+                tooltip += "\n" + "\n".join(f"• {label}" for label in labels)
+            item.setToolTip(tooltip)
+            item.setSizeHint(item.sizeHint() * 1.25)
             self.gpio_ports.addItem(item)
 
         if port_map:
             lines = []
             for port, labels in sorted(port_map.items()):
-                preview = ", ".join(_short_label(label) for label in labels[:4])
-                if len(labels) > 4:
-                    preview += f" (+{len(labels) - 4})"
-                lines.append(f"{port}: {preview}")
-            if len(lines) > 8:
-                hidden = len(lines) - 8
-                lines = lines[:8] + [f"+{hidden} more ports"]
+                preview = ", ".join(_short_label(label) for label in labels[:5])
+                if len(labels) > 5:
+                    preview += f" (+{len(labels) - 5})"
+                lines.append(f"{port}  →  {preview}")
+            if len(lines) > 12:
+                hidden = len(lines) - 12
+                lines = lines[:12] + [f"+{hidden} más puertos"]
             self.gpio_preview.setText("\n".join(lines))
         else:
             self.gpio_preview.setText("Drop labels onto a GPIO port")
+
+        self._gpio_for_label = {str(label): str(port) for label, port in assignments.items() if str(port).strip()}
+        self._refresh_label_tooltips()
+        self._update_coverage()
+        self.filter_label_views(self.label_search.text())
+
+    def set_label_assignments(self, camera_for_label: dict[str, list[str]]) -> None:
+        self._camera_for_label = {name: list(cams) for name, cams in (camera_for_label or {}).items()}
+        self._refresh_label_tooltips()
+        self._update_coverage()
+        self.filter_label_views(self.label_search.text())
+
+    def _update_coverage(self) -> None:
+        total = sum(1 for i in range(self.labels.count()) if not self.labels.item(i).data(Qt.ItemDataRole.UserRole + 1))
+        if total == 0:
+            self.coverage_label.setText("0 labels")
+            return
+        names = []
+        for i in range(self.labels.count()):
+            item = self.labels.item(i)
+            if item.data(Qt.ItemDataRole.UserRole + 1):
+                continue
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(data, dict):
+                names.append(data.get("name", ""))
+        with_camera = sum(1 for name in names if self._camera_for_label.get(name))
+        with_gpio = sum(1 for name in names if self._gpio_for_label.get(name))
+        self.coverage_label.setText(
+            f"{total} labels · cám {with_camera}/{total} · gpio {with_gpio}/{total}"
+        )
 
     def set_label_previews(self, items: list[dict]) -> None:
         self._label_source = list(items)
@@ -740,7 +1170,15 @@ class ForgePanel(QWidget):
         label_type = str(item.get("type", "")).strip()
         color = str(item.get("color", "")).strip()
         crop = str(item.get("preview_base64", "")).strip()
-        text = "\n".join([f"Name: {name}", f"Type: {label_type or 'n/a'}", f"Color: {color or 'n/a'}"])
+        cams = self._camera_for_label.get(name, [])
+        gpio = self._gpio_for_label.get(name, "")
+        text = "\n".join([
+            f"Name: {name}",
+            f"Type: {label_type or 'n/a'}",
+            f"Color: {color or 'n/a'}",
+            f"Cámaras: {', '.join(cams) if cams else '—'}",
+            f"GPIO: {gpio or '—'}",
+        ])
         self.label_detail.setText(text)
         pixmap = QPixmap()
         if crop and pixmap.loadFromData(base64.b64decode(crop)):
@@ -760,10 +1198,17 @@ class ForgePanel(QWidget):
         self.label_selected.emit(item)
 
     def _on_label_item_clicked(self, item: QListWidgetItem) -> None:
+        if item.data(Qt.ItemDataRole.UserRole + 1):
+            return
         data = item.data(Qt.ItemDataRole.UserRole)
         if isinstance(data, dict):
             self.set_selected_label_preview(data)
             self.label_selected.emit(data)
+
+    def _emit_bulk_clear(self) -> None:
+        labels = self.selected_labels()
+        if labels:
+            self.bulk_clear_requested.emit(labels)
 
     def set_project_preview(self, image_data: bytes | None) -> None:
         if not image_data:
@@ -835,18 +1280,75 @@ class ForgePanel(QWidget):
     def selected_labels(self) -> list[str]:
         selected = []
         for item in self.labels.selectedItems():
+            if item.data(Qt.ItemDataRole.UserRole + 1):
+                continue
             data = item.data(Qt.ItemDataRole.UserRole)
             if isinstance(data, dict):
-                selected.append(str(data.get("name", "")).strip())
+                name = str(data.get("name", "")).strip()
+                if name:
+                    selected.append(name)
             else:
                 selected.append(item.text())
         if selected:
-            return selected
+            return list(dict.fromkeys(selected))
         item = self.labels.currentItem()
-        if not item:
+        if not item or item.data(Qt.ItemDataRole.UserRole + 1):
             return []
         data = item.data(Qt.ItemDataRole.UserRole)
         if isinstance(data, dict):
             name = str(data.get("name", "")).strip()
             return [name] if name else []
         return [item.text()]
+
+    def _restore_state(self) -> None:
+        try:
+            if not UI_STATE_PATH.exists():
+                return
+            payload = json.loads(UI_STATE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+        sizes = payload.get("forge_splitter_sizes")
+        if isinstance(sizes, list) and all(isinstance(v, int) for v in sizes) and len(sizes) == self.splitter.count():
+            self.splitter.setSizes(sizes)
+        for section, key in (
+            (self.project_section, "section_projects"),
+            (self.camera_section, "section_cameras"),
+            (self.line_section, "section_lines"),
+        ):
+            if key in payload and isinstance(payload[key], bool):
+                section.set_expanded(payload[key])
+        group = payload.get("group_mode")
+        if isinstance(group, str):
+            idx = self.group_combo.findData(group)
+            if idx >= 0:
+                self.group_combo.setCurrentIndex(idx)
+        filter_mode = payload.get("filter_mode")
+        if isinstance(filter_mode, str) and filter_mode in self._filter_buttons:
+            self._set_filter_mode(filter_mode)
+        tab_index = payload.get("right_tab_index")
+        if isinstance(tab_index, int) and 0 <= tab_index < self.right_tabs.count():
+            self.right_tabs.setCurrentIndex(tab_index)
+
+    def save_state(self) -> None:
+        try:
+            UI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            payload: dict = {}
+            if UI_STATE_PATH.exists():
+                try:
+                    existing = json.loads(UI_STATE_PATH.read_text(encoding="utf-8"))
+                    if isinstance(existing, dict):
+                        payload = existing
+                except Exception:
+                    payload = {}
+            payload["forge_splitter_sizes"] = self.splitter.sizes()
+            payload["section_projects"] = self.project_section.is_expanded()
+            payload["section_cameras"] = self.camera_section.is_expanded()
+            payload["section_lines"] = self.line_section.is_expanded()
+            payload["group_mode"] = self._group_mode
+            payload["filter_mode"] = self._filter_mode
+            payload["right_tab_index"] = self.right_tabs.currentIndex()
+            UI_STATE_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass

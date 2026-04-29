@@ -45,3 +45,6 @@ SIMULATION_MODE=true
 
 The GUI loads `FORGE_USERNAME/FORGE_PASSWORD` and `CVAT_USERNAME/CVAT_PASSWORD` automatically and uses them for API requests.
 In the Forge tab, select a project to load its labels, then pick a GPIO port and assign the selected labels to that port.
+
+Video input is stored in `configs/inference_source.json`. The app will auto-detect USB/CSI cameras on Linux and can be switched to RTSP from the Settings dialog.
+Use the RTSP section in Settings to add, remove, and set the default stream.
