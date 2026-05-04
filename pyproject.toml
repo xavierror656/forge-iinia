@@ -3,7 +3,7 @@ name = "edgevision-control-hub"
 version = "0.1.0"
 description = "Edge desktop hub bridging Forge with on-device inference and GPIO control."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "PyQt6>=6.7,<6.8",
     "numpy>=1.26",
@@ -11,6 +11,8 @@ dependencies = [
     "ultralytics>=8.3",
     "PyYAML>=6.0",
     "gpiozero>=2.0",
+    "torch>=2.0",
+    "torchvision>=0.15",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +27,17 @@ dev = [
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'aarch64'",
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+# En Jetson (aarch64) usar wheels precompilados con CUDA en lugar de los de PyPI
+# Wheels precompilados con CUDA para JetPack 6.1 (Python 3.10, aarch64)
+# En x86_64 o Python 3.11+ se usan los wheels normales de PyPI
+[tool.uv.sources]
+torch = [
+    { url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/torch-2.10.0-cp310-cp310-linux_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64' and python_version == '3.10'" },
+]
+torchvision = [
+    { url = "https://github.com/ultralytics/assets/releases/download/v0.0.0/torchvision-0.25.0-cp310-cp310-linux_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64' and python_version == '3.10'" },
 ]
 
 [tool.ruff]
