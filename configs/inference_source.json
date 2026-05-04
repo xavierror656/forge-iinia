@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "mode": "webcam",
+  "rtsp_url": "rtsp://10.0.0.10:554/stream",
+  "rtsp_username": "",
+  "rtsp_password": "",
+  "default_rtsp_camera": "Cam Norte",
+  "rtsp_cameras": [
+    {
+      "name": "Cam Norte",
+      "url": "rtsp://10.0.0.10:554/stream",
+      "username": "",
+      "password": "",
+      "enabled": true
+    },
+    {
+      "name": "Cam Sur",
+      "url": "rtsp://10.0.0.11:554/stream",
+      "username": "",
+      "password": "",
+      "enabled": true
+    },
+    {
+      "name": "Cam Este",
+      "url": "rtsp://10.0.0.12:554/stream",
+      "username": "",
+      "password": "",
+      "enabled": false
+    }
+  ],
+  "camera_source": "/dev/video0",
+  "camera_label": "Webcam video0",
+  "camera_backend": "v4l2",
+  "local_cameras": [
+    {
+      "name": "Webcam video0",
+      "kind": "webcam",
+      "source": "/dev/video0",
+      "backend": "v4l2",
+      "enabled": true
+    },
+    {
+      "name": "Webcam video2",
+      "kind": "webcam",
+      "source": "/dev/video2",
+      "backend": "v4l2",
+      "enabled": true
+    }
+  ],
+  "last_resolved_source": "/dev/video0",
+  "last_resolved_label": "Webcam video0",
+  "last_resolved_kind": "webcam",
+  "last_resolved_backend": "v4l2",
+  "discovered_sources": []
+}
