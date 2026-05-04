@@ -5,7 +5,7 @@ description = "Edge desktop hub bridging Forge with on-device inference and GPIO
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "PyQt6>=6.7",
+    "PyQt6>=6.7,<6.8",
     "numpy>=1.26",
     "opencv-python>=4.10",
     "ultralytics>=8.3",
@@ -19,6 +19,12 @@ dev = [
     "mypy>=1.11",
     "pytest>=8.0",
     "pre-commit>=3.7",
+]
+
+[tool.uv]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 [tool.ruff]
