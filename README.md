@@ -18,7 +18,8 @@ sudo cp /var/cudss-local-tegra-repo-ubuntu2204-0.7.1/cudss-*-keyring.gpg /usr/sh
 sudo apt-get update && sudo apt-get -y install cudss
 
 # 4. onnxruntime-gpu (solo necesario para exportar modelos a ONNX/TensorRT)
-uv pip install https://github.com/ultralytics/assets/releases/download/v0.0.0/onnxruntime_gpu-1.23.0-cp310-cp310-linux_aarch64.whl
+#    Usar pip3 del sistema porque el wheel es cp310 y uv usa Python 3.14
+pip3 install https://github.com/ultralytics/assets/releases/download/v0.0.0/onnxruntime_gpu-1.23.0-cp310-cp310-linux_aarch64.whl
 
 # 5. Reboot y correr
 sudo reboot
