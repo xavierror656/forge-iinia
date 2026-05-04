@@ -1,32 +1,53 @@
 # EdgeVision Control Hub
 
-## Install
+## Install (uv — recomendado)
+
+[uv](https://docs.astral.sh/uv/) instala Python y dependencias en segundos sin necesidad de crear el venv manualmente.
+
+```bash
+# 1. Instalar uv (una sola vez por máquina)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Clonar el repo
+git clone https://github.com/xavierror656/forge-iinia.git
+cd forge-iinia
+
+# 3. Crear entorno e instalar dependencias desde el lock file
+uv sync
+
+# 4. Correr la app
+uv run python main.py
+```
+
+Para instalar también las herramientas de desarrollo (ruff, mypy, pytest):
+
+```bash
+uv sync --extra dev
+```
+
+Regenerar el lock file cuando cambien las dependencias:
+
+```bash
+uv lock
+```
+
+---
+
+## Install (venv clásico)
 
 ```bash
 python3 -m venv .venv
-./.venv/bin/python -m pip install -r requirements.txt
-```
-
-For a fully reproducible install, use the lock file:
-
-```bash
 ./.venv/bin/python -m pip install -r requirements.lock
 ```
 
-Regenerate the lock with:
-
-```bash
-./.venv/bin/pip-compile --strip-extras --output-file=requirements.lock requirements.txt
-```
-
-For development (linting, type-checking, hooks):
+Para desarrollo:
 
 ```bash
 ./.venv/bin/python -m pip install -e ".[dev]"
 ./.venv/bin/pre-commit install
 ```
 
-Run lint and type checks manually:
+Lint y tipos:
 
 ```bash
 ./.venv/bin/ruff check core/
@@ -36,13 +57,15 @@ Run lint and type checks manually:
 ## Run GUI
 
 ```bash
+uv run python main.py
+# o con venv:
 ./.venv/bin/python main.py
 ```
 
 ## Run headless validation
 
 ```bash
-QT_QPA_PLATFORM=offscreen ./.venv/bin/python main.py --headless
+QT_QPA_PLATFORM=offscreen uv run python main.py --headless
 ```
 
 ## Config
