@@ -30,6 +30,7 @@ class HardwareInfo:
     recommended_model_format: str
     deployment_note: str
     ui_profile: UIProfile
+    max_active_cameras: int
 
 
 class HardwareProvider(abc.ABC):
@@ -75,6 +76,7 @@ class JetsonProvider(HardwareProvider):
             recommended_model_format=".engine",
             deployment_note="Jetson: prefer TensorRT engine exports and GStreamer with nvarguscamerasrc.",
             ui_profile="multi",
+            max_active_cameras=0,
         )
 
     def temperature_sources(self) -> tuple[str, ...]:
@@ -108,6 +110,7 @@ class RaspberryProvider(HardwareProvider):
             recommended_model_format=".imx",
             deployment_note="Raspberry Pi AI Camera: prefer IMX500 exports; otherwise use v4l2src for development.",
             ui_profile="single",
+            max_active_cameras=1,
         )
 
     def temperature_sources(self) -> tuple[str, ...]:
@@ -139,6 +142,7 @@ class DevelopmentProvider(HardwareProvider):
             recommended_model_format=".pt/.onnx",
             deployment_note="Development: use local files, webcam, or prerecorded videos for validation.",
             ui_profile="desktop",
+            max_active_cameras=0,
         )
 
     def temperature_sources(self) -> tuple[str, ...]:
@@ -221,9 +225,17 @@ class HardwareManager:
     def supports_tensor_rt(self) -> bool:
         return self._provider.supports_tensor_rt()
 
+    def temperature_sources(self) -> tuple[str, ...]:
+        return self._provider.temperature_sources()
+
     def is_simulation(self) -> bool:
         return self._provider.is_simulation()
 
     @property
     def ui_profile(self) -> UIProfile:
         return self._provider.info().ui_profile
+
+    @property
+    def max_active_cameras(self) -> int:
+        """Return 0 for unlimited, or the hardware camera worker limit."""
+        return self._provider.info().max_active_cameras

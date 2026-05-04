@@ -250,6 +250,16 @@ def build_rtsp_url(url: str, username: str = "", password: str = "") -> str:
     return urlunsplit((parts.scheme or "rtsp", netloc, parts.path, parts.query, parts.fragment))
 
 
+def build_rtsp_gstreamer_pipeline(url: str, *, latency_ms: int = 100) -> str:
+    escaped = str(url).replace('"', '\\"')
+    return (
+        f'rtspsrc location="{escaped}" protocols=tcp latency={max(0, latency_ms)} ! '
+        "rtph264depay ! h264parse ! nvv4l2decoder ! "
+        "nvvidconv ! video/x-raw,format=BGRx ! videoconvert ! video/x-raw,format=BGR ! "
+        "appsink drop=true sync=false max-buffers=1"
+    )
+
+
 def normalize_rtsp_url(url: str, username: str = "", password: str = "") -> tuple[str, str]:
     """Return a canonical RTSP URL or an error message."""
     built = build_rtsp_url(url, username, password)
@@ -425,6 +435,12 @@ def resolve_video_source_candidates(
         seen.add(choice.source)
         candidates.append(choice)
 
+    def limited() -> list[VideoSourceChoice]:
+        max_active = hardware.max_active_cameras
+        if max_active > 0:
+            return candidates[:max_active]
+        return candidates
+
     mode = InferenceSourceConfig._normalize_mode(config.mode)
     rtsp_cameras = _normalized_rtsp_cameras(config)
     local_cameras = [
@@ -454,7 +470,8 @@ def resolve_video_source_candidates(
             if dedup_key in rtsp_seen:
                 continue
             rtsp_seen.add(dedup_key)
-            candidates.append(_choice_from_source(url, kind="rtsp", label=label, backend="ffmpeg"))
+            backend = "gstreamer" if hardware.info.kind == "jetson" else "ffmpeg"
+            candidates.append(_choice_from_source(url, kind="rtsp", label=label, backend=backend))
 
     def add_local_cameras() -> None:
         for camera in local_cameras:
@@ -476,7 +493,7 @@ def resolve_video_source_candidates(
 
     if mode == "rtsp":
         add_rtsp_cameras()
-        return candidates, discovered
+        return limited(), discovered
 
     add_local_cameras()
 
@@ -515,7 +532,7 @@ def resolve_video_source_candidates(
                 add(choice)
                 break
 
-    return candidates, discovered
+    return limited(), discovered
 
 
 def capture_backend_for(choice: VideoSourceChoice) -> int:

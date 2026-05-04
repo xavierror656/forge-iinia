@@ -17,7 +17,7 @@ import time
 import urllib.parse
 import torch
 from threading import Lock
-from dataclasses import asdict, dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +50,7 @@ from PyQt6.QtWidgets import (
 
 import logging
 
-from app.state import DetectionState, TelemetrySnapshot
+from app.state import DetectionState
 from app.threads.watchdog import Watchdog
 from app.widgets.video_widget import OpenGLVideoWidget
 from core.async_worker import AsyncWorker
@@ -62,6 +62,7 @@ from core.logging_config import configure as configure_logging
 from core.output_adapters import InferenceOutputDispatcher, InferenceOutputConfig, inference_payload_from_frame
 from core.shutdown import install_signal_handlers
 from core.telemetry_log import TelemetryLog
+from core.telemetry import TelemetryCollector
 
 
 log = logging.getLogger("edgevision")
@@ -85,6 +86,7 @@ from core.video_source import (
     VIDEO_SOURCE_PATH,
     InferenceSourceConfig,
     VideoSourceChoice,
+    build_rtsp_gstreamer_pipeline,
     capture_backend_for,
     load_inference_source_config,
     resolve_video_source_candidates,
@@ -98,8 +100,9 @@ from ui.detection_overlay import DetectionHistogram
 from ui.forge_panel import CameraCreateDialog, ForgeConfigDialog, ForgePanel
 from ui.gpio_leds import GPIOLedStrip
 from ui.settings_panel import SettingsDialog, SettingsPanel
-from ui.icons import icon as _icon
+from ui.icons import clear_cache as _clear_icon_cache, icon as _icon
 from ui.sparkline import Sparkline
+from ui.theme import app_stylesheet, tokens
 from ui.toast import ToastManager
 
 
@@ -147,6 +150,7 @@ class InferenceWorker(QThread):
         self._forced_choice = forced_choice
         self._model: Any = None
         self._pending_model_signature: tuple[float, int] | None = None
+        self._telemetry = TelemetryCollector(hardware)
 
     @property
     def camera_id(self) -> str:
@@ -292,6 +296,14 @@ class InferenceWorker(QThread):
         backend = capture_backend_for(choice)
         source: Any = choice.source
         if choice.kind == "rtsp" or str(source).startswith("rtsp://"):
+            if choice.backend.lower().strip() == "gstreamer" and self._hardware.info.kind == "jetson":
+                pipeline = build_rtsp_gstreamer_pipeline(str(source))
+                capture = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+                if capture.isOpened():
+                    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    return capture
+                capture.release()
+                self.log_message.emit("RTSP GStreamer no disponible, usando FFmpeg.")
             backend = cv2.CAP_FFMPEG
             params = [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 4000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 4000]
             try:
@@ -543,18 +555,8 @@ class InferenceWorker(QThread):
         }
         self.frame_ready.emit(frame)
 
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        fps = 1.0 / max(0.001, time.perf_counter() - start)
-        telemetry = TelemetrySnapshot(
-            capture_fps=fps,
-            inference_fps=fps,
-            latency_ms=elapsed_ms,
-            ram_mb=256.0,
-            vram_mb=128.0 if self._hardware.supports_tensor_rt() else 0.0,
-            soc_temp_c=0.0,
-            provider_name=self._hardware.info.name,
-        )
-        self.telemetry_ready.emit(asdict(telemetry))
+        telemetry = self._telemetry.snapshot(elapsed_seconds=time.perf_counter() - start)
+        self.telemetry_ready.emit(telemetry.as_dict())
 
     def run(self) -> None:
         self._load_model()
@@ -787,6 +789,9 @@ class MainWindow(QMainWindow):
         Auto-discovered local devices are not promoted to tiles to avoid
         spawning workers for /dev/videoN nodes that can't be captured.
         """
+        if self._hardware.max_active_cameras == 1:
+            return []
+
         config = self._video_source_config
         mode = (config.mode or "auto").strip().lower()
         if mode == "rtsp":
@@ -1402,6 +1407,7 @@ class MainWindow(QMainWindow):
             parent=self,
             ui_profile=self._hardware.ui_profile,
         )
+        dialog.panel.set_theme("dark" if self.dark_mode_switch.isChecked() else "light")
         dialog.panel.env_changed.connect(self._apply_env_settings)
         dialog.panel.video_source_changed.connect(self._apply_video_source_config)
         dialog.panel.forge_test_requested.connect(self._test_forge_connection)
@@ -1670,25 +1676,35 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is None:
             return
-        if enabled:
-            app.setStyleSheet(
-                """
-                QMainWindow, QWidget { background: #0f1115; color: #e6eaf2; }
-                QLabel { color: #e6eaf2; }
-                QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QComboBox {
-                    background: #171a21; color: #e6eaf2; border: 1px solid #2a313a; border-radius: 6px; padding: 6px;
-                }
-                QPushButton {
-                    background: #1f2430; color: #e6eaf2; border: 1px solid #2a313a; border-radius: 6px; padding: 6px 10px;
-                }
-                QPushButton:hover { background: #272d3a; }
-                QTabWidget::pane { border: 1px solid #2a313a; }
-                QTabBar::tab { background: #1a1f28; color: #cfd6e1; padding: 8px 12px; }
-                QTabBar::tab:selected { background: #232a36; }
-                """
+        theme = "dark" if enabled else "light"
+        app.setProperty("uiTheme", theme)
+        _clear_icon_cache()
+        app.setStyleSheet(app_stylesheet(theme))
+        if hasattr(self, "settings_panel") and self.settings_panel is not None:
+            self.settings_panel.set_theme(theme)
+        self._refresh_theme_assets()
+
+    def _refresh_theme_assets(self) -> None:
+        t = tokens("dark" if self.dark_mode_switch.isChecked() else "light")
+        self.setWindowIcon(_icon("app", size=24))
+        self.hardware_icon.setPixmap(_icon("cpu", size=16, color="muted").pixmap(16, 16))
+        self.simulation_switch.setIcon(_icon("cpu", size=16))
+        self.settings_button.setIcon(_icon("gear", size=16))
+        self.dark_mode_switch.setIcon(_icon("moon" if self.dark_mode_switch.isChecked() else "sun", size=16))
+        self.tabs.setTabIcon(0, _icon("camera-video", size=16))
+        self.tabs.setTabIcon(1, _icon("box-seam", size=16))
+        self.tabs.setTabIcon(2, _icon("terminal", size=16))
+        if hasattr(self, "status_banner"):
+            self.status_banner.setStyleSheet(
+                f"padding: 6px 10px; border-radius: 6px; background:{t['surface']}; color:{t['text']}; border:1px solid {t['border']};"
             )
-        else:
-            app.setStyleSheet("")
+        if hasattr(self, "pool_banner"):
+            self.pool_banner.setStyleSheet(
+                f"padding: 6px 10px; border-radius: 6px; background:{t['surface']}; color:{t['muted']}; border:1px solid {t['border']};"
+            )
+        self._set_status(self.status_banner.text() if hasattr(self, "status_banner") else "")
+        self._refresh_live_summary()
+        self._refresh_pool_banner()
 
     def _run_async(self, fn, *, on_ok=None, on_error=None, busy_text: str | None = None) -> None:
         worker = AsyncWorker(fn, self)

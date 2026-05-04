@@ -125,3 +125,93 @@ In the Forge tab, select a project to load its labels, then pick a GPIO port and
 
 Video input is stored in `configs/inference_source.json`. The app will auto-detect USB/CSI cameras on Linux and can be switched to RTSP from the Settings dialog.
 Use the RTSP section in Settings to add, remove, and set the default stream.
+
+## Hardware profiles
+
+The app detects the runtime board automatically. You can force a profile with `HARDWARE_OVERRIDE=jetson`, `HARDWARE_OVERRIDE=raspberry`, or `HARDWARE_OVERRIDE=development`.
+
+Jetson:
+- Uses the multi-camera UI profile.
+- Allows multiple active camera workers.
+- Prefers RTSP through GStreamer for lower latency and hardware decode, then falls back to FFmpeg if the GStreamer pipeline is unavailable.
+
+Raspberry Pi:
+- Uses the single-camera UI profile.
+- Limits inference to one active camera because the board is resource constrained.
+- Uses FFmpeg for RTSP instead of GStreamer.
+
+Development:
+- Uses the desktop UI profile.
+- Keeps multiple cameras available for testing.
+
+## Theme
+
+Set `UI_THEME=dark` or `UI_THEME=light` in `.env`, or switch it from the settings panel. Colors and icons share the same theme tokens so dark/light modes keep readable contrast.
+
+## RTSP notes
+
+RTSP cameras are configured in Settings and saved to `configs/inference_source.json`.
+
+On Jetson, the app first tries this GStreamer path for RTSP streams:
+
+```text
+rtspsrc protocols=tcp latency=100 ! rtph264depay ! h264parse ! nvv4l2decoder ! nvvidconv ! videoconvert ! appsink
+```
+
+If that fails, it automatically retries the same RTSP URL with FFmpeg. On Raspberry, RTSP starts directly with FFmpeg and only one camera is run.
+
+## Telemetry
+
+Runtime telemetry is collected by `core/telemetry.py` and recorded by `core/telemetry_log.py` into `captures/telemetry.jsonl`.
+
+The UI shows:
+- Capture FPS.
+- Inference FPS.
+- Latency in milliseconds.
+- Process RAM usage.
+- SOC temperature when the board exposes a thermal sensor.
+- Active hardware provider.
+
+Telemetry is sampled from each inference loop and persisted periodically, so screenshots and logs can be matched when debugging performance on Raspberry or Jetson.
+
+## Screenshots for the repo
+
+Recommended location:
+
+```bash
+docs/screenshots/
+```
+
+Run the app, open the screen you want to document, then capture with one of these options:
+
+```bash
+# GNOME screenshot tool
+gnome-screenshot -a -f docs/screenshots/live-view.png
+
+# If ImageMagick is installed
+import docs/screenshots/settings-panel.png
+
+# Full screen with scrot
+scrot docs/screenshots/full-app.png
+```
+
+Suggested screenshots:
+- `docs/screenshots/live-view.png`: Live tab with video, telemetry and status banners.
+- `docs/screenshots/settings-video.png`: Settings dialog showing video source configuration.
+- `docs/screenshots/forge-assignments.png`: Forge tab showing labels assigned to camera/GPIO.
+- `docs/screenshots/light-theme.png`: Light mode verification.
+- `docs/screenshots/dark-theme.png`: Dark mode verification.
+
+Add screenshots to the README with:
+
+```markdown
+![Live view](docs/screenshots/live-view.png)
+```
+
+Current dark-mode screenshots:
+
+![Live dark tab](docs/screenshots/live-dark.png)
+
+![Forge dark tab](docs/screenshots/forge-dark.png)
+
+![Logs dark tab](docs/screenshots/logs-dark.png)

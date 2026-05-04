@@ -40,174 +40,7 @@ from core.video_source import (
     save_inference_source_config,
 )
 from ui.icons import icon
-
-_STYLESHEET = """
-/* Panel background */
-SettingsPanel {
-    background: #11141a;
-}
-
-/* Group boxes with accent-left border */
-QGroupBox {
-    font-size: 13px;
-    font-weight: 600;
-    color: #e6eaf2;
-    border: 1px solid #2a313a;
-    border-radius: 8px;
-    margin-top: 18px;
-    padding: 16px 16px 16px 20px;
-    padding-left: 28px;
-    background: #171a21;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 28px;
-    padding: 0 6px 0 6px;
-    color: #62d2a2;
-}
-
-/* Form labels */
-QLabel {
-    color: #6c7680;
-    font-size: 12px;
-}
-
-/* Line edits */
-QLineEdit {
-    background: #1c1f28;
-    border: 1px solid #2a313a;
-    border-radius: 6px;
-    padding: 6px 10px;
-    color: #e6eaf2;
-    font-size: 13px;
-}
-QLineEdit:focus {
-    border-color: #62d2a2;
-}
-
-/* Combo boxes */
-QComboBox {
-    background: #1c1f28;
-    border: 1px solid #2a313a;
-    border-radius: 6px;
-    padding: 5px 10px;
-    color: #e6eaf2;
-    font-size: 13px;
-    min-width: 120px;
-}
-QComboBox:focus {
-    border-color: #62d2a2;
-}
-QComboBox::drop-down {
-    border: none;
-    padding-right: 6px;
-}
-QComboBox QAbstractItemView {
-    background: #1c1f28;
-    border: 1px solid #2a313a;
-    color: #e6eaf2;
-    selection-background-color: #2a3140;
-}
-
-/* Buttons */
-QPushButton {
-    background: #1c1f28;
-    border: 1px solid #2a313a;
-    border-radius: 6px;
-    padding: 6px 14px;
-    color: #e6eaf2;
-    font-size: 12px;
-    font-weight: 500;
-}
-QPushButton:hover {
-    background: #252a36;
-    border-color: #3a4356;
-}
-QPushButton:pressed {
-    background: #2a3140;
-}
-
-/* Scroll area */
-QScrollArea {
-    background: transparent;
-    border: none;
-}
-QScrollArea > QWidget > QWidget {
-    background: transparent;
-}
-QScrollBar:vertical {
-    background: #11141a;
-    width: 8px;
-    border-radius: 4px;
-}
-QScrollBar::handle:vertical {
-    background: #2a313a;
-    border-radius: 4px;
-    min-height: 30px;
-}
-QScrollBar::handle:vertical:hover {
-    background: #3a4356;
-}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-    height: 0px;
-}
-
-/* Card frames */
-QFrame#rtspCard {
-    background: #171a21;
-    border: 1px solid #2a313a;
-    border-radius: 10px;
-    padding: 12px;
-}
-
-/* Status labels */
-QLabel#statusOk { color: #62d2a2; font-size: 11px; font-weight: 600; }
-QLabel#statusOff { color: #e66b6b; font-size: 11px; font-weight: 600; }
-QLabel#statusTesting { color: #f4b942; font-size: 11px; font-weight: 600; }
-
-/* Section header */
-QLabel#sectionHeader {
-    color: #62d2a2;
-    font-size: 13px;
-    font-weight: 700;
-    padding: 4px 0px;
-}
-
-/* Badge / chip */
-QLabel#badge {
-    background: #1c1f28;
-    border: 1px solid #2a313a;
-    border-radius: 10px;
-    padding: 2px 10px;
-    color: #e6eaf2;
-    font-size: 11px;
-}
-
-/* Checkbox */
-QCheckBox {
-    color: #6c7680;
-    font-size: 12px;
-}
-QCheckBox::indicator {
-    width: 16px;
-    height: 16px;
-    border-radius: 4px;
-    border: 1px solid #3a4356;
-    background: #1c1f28;
-}
-QCheckBox::indicator:checked {
-    background: #62d2a2;
-    border-color: #62d2a2;
-}
-
-/* Section accent bar */
-QWidget#sectionAccent {
-    background: #62d2a2;
-    border-radius: 2px;
-    min-width: 3px;
-    max-width: 3px;
-}
-"""
+from ui.theme import settings_panel_stylesheet
 
 
 class SettingsPanel(QWidget):
@@ -236,7 +69,11 @@ class SettingsPanel(QWidget):
         self._local_selected_index: int | None = None
         self._build_ui()
         self.load_env()
-        self.setStyleSheet(_STYLESHEET)
+        self.set_theme("dark")
+
+    def set_theme(self, theme: str) -> None:
+        self.setStyleSheet(settings_panel_stylesheet(theme))
+        self._apply_icons()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
