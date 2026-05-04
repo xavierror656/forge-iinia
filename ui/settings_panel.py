@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -9,6 +10,7 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGroupBox,
@@ -252,11 +254,13 @@ class SettingsPanel(QWidget):
         env_file_row.addWidget(self.env_file, 1)
         self.reload_button = QPushButton("Cargar .env")
         self.save_button = QPushButton("Guardar .env")
+        self.import_env_button = QPushButton("Importar .env")
         self.test_forge_button = QPushButton("Probar Forge")
         self.test_forge_button.setToolTip("Verifica las credenciales con un ping al backend")
         self.test_forge_button.clicked.connect(self._on_test_forge_clicked)
         env_file_row.addWidget(self.reload_button)
         env_file_row.addWidget(self.save_button)
+        env_file_row.addWidget(self.import_env_button)
         env_file_row.addWidget(self.test_forge_button)
         env_layout.addLayout(env_file_row)
 
@@ -390,10 +394,12 @@ class SettingsPanel(QWidget):
         source_status_layout.addWidget(self.source_status, 1)
         self.detect_sources_button = QPushButton("Detectar")
         self.save_source_button = QPushButton("Guardar JSON")
+        self.import_source_button = QPushButton("Importar JSON")
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
         buttons.addWidget(self.detect_sources_button)
         buttons.addWidget(self.save_source_button)
+        buttons.addWidget(self.import_source_button)
         buttons.addStretch(1)
 
         source_form.addRow("Modo", self.source_mode)
@@ -563,8 +569,10 @@ class SettingsPanel(QWidget):
 
         self.reload_button.clicked.connect(self.load_env)
         self.save_button.clicked.connect(self.save_env)
+        self.import_env_button.clicked.connect(self.import_env_file)
         self.detect_sources_button.clicked.connect(self.refresh_video_sources)
         self.save_source_button.clicked.connect(self.save_video_source)
+        self.import_source_button.clicked.connect(self.import_video_source_file)
         self.new_rtsp_button.clicked.connect(self._new_rtsp_camera)
         self.add_rtsp_button.clicked.connect(self._add_or_update_rtsp_camera)
         self.test_rtsp_button.clicked.connect(self._test_rtsp_camera)
@@ -593,8 +601,10 @@ class SettingsPanel(QWidget):
     def _apply_icons(self) -> None:
         self.reload_button.setIcon(icon("arrow-clockwise", size=16))
         self.save_button.setIcon(icon("save2", size=16))
+        self.import_env_button.setIcon(icon("upload", size=16, color="info"))
         self.detect_sources_button.setIcon(icon("camera-video", size=16))
         self.save_source_button.setIcon(icon("save", size=16))
+        self.import_source_button.setIcon(icon("file-earmark-arrow-up", size=16, color="info"))
         self.new_rtsp_button.setIcon(icon("plus-circle", size=16, color="accent"))
         self.add_rtsp_button.setIcon(icon("check-circle", size=16, color="accent"))
         self.test_rtsp_button.setIcon(icon("ethernet", size=16, color="info"))
@@ -822,6 +832,66 @@ class SettingsPanel(QWidget):
         }
         write_env_file(path, values)
         self.env_changed.emit(values)
+
+    def import_env_file(self) -> None:
+        selected, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Importar configuración .env",
+            str(Path.home()),
+            "Env files (*.env *.txt);;All files (*)",
+        )
+        if not selected:
+            return
+        source = Path(selected)
+        target = Path(self.env_file.text().strip() or ".env")
+        try:
+            values = read_env_file(source)
+            if not values:
+                raise ValueError("El archivo no contiene claves KEY=VALUE válidas.")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
+        except Exception as exc:
+            self.forge_test_status.setText(f"No se pudo importar .env: {exc}")
+            self.forge_test_status.setStyleSheet("color:#e66b6b; font-size:11px;")
+            return
+
+        self.load_env()
+        self.forge_test_status.setText(f".env importado desde {source.name}")
+        self.forge_test_status.setStyleSheet("color:#62d2a2; font-size:11px;")
+        self.env_changed.emit(read_env_file(target))
+
+    def import_video_source_file(self) -> None:
+        selected, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Importar inference_source.json",
+            str(Path.home()),
+            "JSON files (*.json);;All files (*)",
+        )
+        if not selected:
+            return
+        source = Path(selected)
+        try:
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("El JSON debe tener un objeto en la raíz.")
+            config = InferenceSourceConfig.from_mapping(payload)
+            save_inference_source_config(VIDEO_SOURCE_PATH, config)
+        except Exception as exc:
+            self._set_source_status(
+                f"No se pudo importar JSON: {exc}",
+                icon_name="x-circle",
+                icon_color="danger",
+            )
+            return
+
+        self._video_source_config = config
+        self.load_video_source()
+        self._set_source_status(
+            f"Fuente importada desde {source.name}",
+            icon_name="file-earmark-check",
+            icon_color="accent",
+        )
+        self.video_source_changed.emit(config.to_mapping())
 
     def _rtsp_camera_from_fields(self) -> dict[str, object] | None:
         url = self.rtsp_url.text().strip()
