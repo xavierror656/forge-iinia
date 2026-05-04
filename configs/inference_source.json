@@ -1,55 +1,33 @@
 {
   "version": 1,
-  "mode": "webcam",
-  "rtsp_url": "rtsp://10.0.0.10:554/stream",
-  "rtsp_username": "",
-  "rtsp_password": "",
-  "default_rtsp_camera": "Cam Norte",
+  "mode": "rtsp",
+  "rtsp_url": "rtsp://192.168.100.21:554/live",
+  "rtsp_username": "admin",
+  "rtsp_password": "12345678",
+  "default_rtsp_camera": "Cam 192.168.100.21",
   "rtsp_cameras": [
     {
-      "name": "Cam Norte",
-      "url": "rtsp://10.0.0.10:554/stream",
-      "username": "",
-      "password": "",
+      "name": "Cam 192.168.100.21",
+      "url": "rtsp://192.168.100.21:554/live",
+      "username": "admin",
+      "password": "12345678",
       "enabled": true
     },
     {
-      "name": "Cam Sur",
-      "url": "rtsp://10.0.0.11:554/stream",
-      "username": "",
-      "password": "",
+      "name": "Cam 192.168.100.21 (2)",
+      "url": "rtsp://192.168.100.21:554/live",
+      "username": "admin",
+      "password": "12345678",
       "enabled": true
-    },
-    {
-      "name": "Cam Este",
-      "url": "rtsp://10.0.0.12:554/stream",
-      "username": "",
-      "password": "",
-      "enabled": false
     }
   ],
   "camera_source": "/dev/video0",
   "camera_label": "Webcam video0",
   "camera_backend": "v4l2",
-  "local_cameras": [
-    {
-      "name": "Webcam video0",
-      "kind": "webcam",
-      "source": "/dev/video0",
-      "backend": "v4l2",
-      "enabled": true
-    },
-    {
-      "name": "Webcam video2",
-      "kind": "webcam",
-      "source": "/dev/video2",
-      "backend": "v4l2",
-      "enabled": true
-    }
-  ],
-  "last_resolved_source": "/dev/video0",
-  "last_resolved_label": "Webcam video0",
-  "last_resolved_kind": "webcam",
-  "last_resolved_backend": "v4l2",
+  "local_cameras": [],
+  "last_resolved_source": "rtsp://admin:12345678@192.168.100.21:554/live",
+  "last_resolved_label": "Cam 192.168.100.21",
+  "last_resolved_kind": "rtsp",
+  "last_resolved_backend": "ffmpeg",
   "discovered_sources": []
 }

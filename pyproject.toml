@@ -13,6 +13,7 @@ dependencies = [
     "gpiozero>=2.0",
     "torch>=2.0",
     "torchvision>=0.15",
+    "paho-mqtt>=2.1.0",
 ]
 
 [project.optional-dependencies]

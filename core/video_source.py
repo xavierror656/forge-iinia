@@ -436,6 +436,8 @@ def resolve_video_source_candidates(
         if cam is not None
     ]
 
+    rtsp_seen: set[str] = set()
+
     def add_rtsp_cameras() -> None:
         for camera in rtsp_cameras:
             if not bool(camera.get("enabled", True)):
@@ -448,7 +450,11 @@ def resolve_video_source_candidates(
             if not url:
                 continue
             label = str(camera.get("name", "")).strip() or friendly_rtsp_name(url)
-            add(_choice_from_source(url, kind="rtsp", label=label, backend="ffmpeg"))
+            dedup_key = f"{label}\x00{url}"
+            if dedup_key in rtsp_seen:
+                continue
+            rtsp_seen.add(dedup_key)
+            candidates.append(_choice_from_source(url, kind="rtsp", label=label, backend="ffmpeg"))
 
     def add_local_cameras() -> None:
         for camera in local_cameras:

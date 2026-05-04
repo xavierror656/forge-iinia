@@ -15,6 +15,7 @@ import traceback
 import queue
 import time
 import urllib.parse
+import torch
 from threading import Lock
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -251,7 +252,8 @@ class InferenceWorker(QThread):
         if frame is None:
             frame = self._simulation_frame()
         try:
-            results = self._model.predict(frame, verbose=False, conf=0.05)
+            _device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            results = self._model.predict(frame, verbose=False, conf=0.05, device=_device)
         except Exception as exc:
             self.log_message.emit(f"Model inference failed, using simulation: {exc}")
             return self._simulate_detections()
@@ -291,12 +293,18 @@ class InferenceWorker(QThread):
         source: Any = choice.source
         if choice.kind == "rtsp" or str(source).startswith("rtsp://"):
             backend = cv2.CAP_FFMPEG
+            params = [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 4000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 4000]
+            try:
+                capture = cv2.VideoCapture(source, backend, params)
+            except TypeError:
+                capture = cv2.VideoCapture(source, backend)
         elif backend in {cv2.CAP_V4L2, cv2.CAP_ANY}:
             match = re.match(r"^(?:/dev/video)?(\d+)$", str(source).strip())
             if match:
                 source = int(match.group(1))
-
-        capture = cv2.VideoCapture(source, backend)
+            capture = cv2.VideoCapture(source, backend)
+        else:
+            capture = cv2.VideoCapture(source, backend)
         if not capture.isOpened():
             capture.release()
             return None
@@ -336,6 +344,7 @@ class InferenceWorker(QThread):
     def _ensure_capture(self) -> None:
         if self._capture is not None:
             return
+        self._last_heartbeat = time.monotonic()
 
         if self._forced_choice is not None:
             self._discovered_sources = []
@@ -441,7 +450,9 @@ class InferenceWorker(QThread):
             return
 
         try:
+            _device = "cuda:0" if torch.cuda.is_available() else "cpu"
             self._model = YOLO(str(self._model_path))
+            self._model.to(_device)
         except Exception as exc:
             self._model = None
             self.log_message.emit(f"Model load failed: {exc}")
@@ -451,7 +462,7 @@ class InferenceWorker(QThread):
         stat = self._model_path.stat()
         self._last_model_mtime = stat.st_mtime
         self._pending_model_signature = None
-        self.log_message.emit(f"Model loaded: {self._model_path.name}")
+        self.log_message.emit(f"Model loaded: {self._model_path.name} (device: {_device})")
         self.model_loaded.emit(str(self._model_path))
 
     def _maybe_hot_reload(self) -> None:
