@@ -14,7 +14,6 @@ import cv2
 
 from core.hardware_manager import HardwareManager
 
-
 VIDEO_SOURCE_PATH = Path("configs/inference_source.json")
 
 
@@ -42,6 +41,7 @@ class InferenceSourceConfig:
     camera_source: str = ""
     camera_label: str = ""
     camera_backend: str = ""
+    local_cameras: list[dict[str, Any]] = field(default_factory=list)
     last_resolved_source: str = ""
     last_resolved_label: str = ""
     last_resolved_kind: str = ""
@@ -53,7 +53,7 @@ class InferenceSourceConfig:
         return str(value).strip() if value is not None else ""
 
     @classmethod
-    def from_mapping(cls, payload: dict[str, Any] | None) -> "InferenceSourceConfig":
+    def from_mapping(cls, payload: dict[str, Any] | None) -> InferenceSourceConfig:
         data = payload if isinstance(payload, dict) else {}
         discovered: list[dict[str, Any]] = []
         raw_discovered = data.get("discovered_sources")
@@ -69,6 +69,8 @@ class InferenceSourceConfig:
                             "available": bool(item.get("available", True)),
                         }
                     )
+
+        local_cameras = cls._normalize_local_cameras(data.get("local_cameras"))
 
         rtsp_cameras = cls._normalize_rtsp_cameras(data.get("rtsp_cameras"))
         legacy_rtsp = cls._normalize_rtsp_camera(
@@ -110,6 +112,7 @@ class InferenceSourceConfig:
             camera_source=cls._text(data.get("camera_source")),
             camera_label=cls._text(data.get("camera_label")),
             camera_backend=cls._text(data.get("camera_backend")),
+            local_cameras=local_cameras,
             last_resolved_source=cls._text(data.get("last_resolved_source")),
             last_resolved_label=cls._text(data.get("last_resolved_label")),
             last_resolved_kind=cls._text(data.get("last_resolved_kind")),
@@ -145,6 +148,43 @@ class InferenceSourceConfig:
             "password": InferenceSourceConfig._text(item.get("password") or item.get("rtsp_password")),
             "enabled": enabled,
         }
+
+    @staticmethod
+    def _normalize_local_camera(item: dict[str, Any], *, fallback_name: str = "Cámara") -> dict[str, Any] | None:
+        source = InferenceSourceConfig._text(item.get("source"))
+        if not source:
+            return None
+        kind_raw = InferenceSourceConfig._text(item.get("kind")).lower()
+        if kind_raw not in {"webcam", "csi"}:
+            kind_raw = "csi" if "!" in source or source.startswith("nvarguscamerasrc") else "webcam"
+        backend_raw = InferenceSourceConfig._text(item.get("backend")).lower()
+        if not backend_raw:
+            backend_raw = "gstreamer" if kind_raw == "csi" else "v4l2"
+        name = InferenceSourceConfig._text(item.get("name") or item.get("label")) or fallback_name
+        enabled_raw = item.get("enabled", True)
+        if isinstance(enabled_raw, str):
+            enabled = enabled_raw.strip().lower() not in {"false", "0", "no", "off"}
+        else:
+            enabled = bool(enabled_raw)
+        return {
+            "name": name,
+            "kind": kind_raw,
+            "source": source,
+            "backend": backend_raw,
+            "enabled": enabled,
+        }
+
+    @classmethod
+    def _normalize_local_cameras(cls, payload: object) -> list[dict[str, Any]]:
+        cameras: list[dict[str, Any]] = []
+        if not isinstance(payload, list):
+            return cameras
+        for index, item in enumerate(payload):
+            if isinstance(item, dict):
+                camera = cls._normalize_local_camera(item, fallback_name=f"Cámara {index + 1}")
+                if camera is not None:
+                    cameras.append(camera)
+        return cameras
 
     @classmethod
     def _normalize_rtsp_cameras(cls, payload: object) -> list[dict[str, Any]]:
@@ -261,7 +301,7 @@ def probe_rtsp_url(url: str, username: str = "", password: str = "", timeout_ms:
             return False, "No se pudo abrir la cámara RTSP."
         for _ in range(2):
             ok, frame = cap.read()
-            if ok and frame is not None and getattr(frame, "size", 0):
+            if ok and frame is not None and int(getattr(frame, "size", 0) or 0) > 0:
                 return True, "Conexión RTSP OK."
         return False, "La cámara abrió pero no devolvió frames."
     finally:
@@ -317,7 +357,7 @@ def _probe_capture(source: str, backend: int) -> bool:
             return False
         for _ in range(2):
             ok, frame = cap.read()
-            if ok and frame is not None and getattr(frame, "size", 0):
+            if ok and frame is not None and int(getattr(frame, "size", 0) or 0) > 0:
                 return True
         return False
     finally:
@@ -387,6 +427,14 @@ def resolve_video_source_candidates(
 
     mode = InferenceSourceConfig._normalize_mode(config.mode)
     rtsp_cameras = _normalized_rtsp_cameras(config)
+    local_cameras = [
+        cam for cam in (
+            InferenceSourceConfig._normalize_local_camera(item, fallback_name=f"Cámara {idx + 1}")
+            for idx, item in enumerate(config.local_cameras)
+            if isinstance(item, dict)
+        )
+        if cam is not None
+    ]
 
     def add_rtsp_cameras() -> None:
         for camera in rtsp_cameras:
@@ -402,9 +450,29 @@ def resolve_video_source_candidates(
             label = str(camera.get("name", "")).strip() or friendly_rtsp_name(url)
             add(_choice_from_source(url, kind="rtsp", label=label, backend="ffmpeg"))
 
+    def add_local_cameras() -> None:
+        for camera in local_cameras:
+            if not bool(camera.get("enabled", True)):
+                continue
+            kind = str(camera.get("kind", "webcam")).strip().lower() or "webcam"
+            if mode == "webcam" and kind != "webcam":
+                continue
+            if mode == "csi" and kind != "csi":
+                continue
+            source = str(camera.get("source", "")).strip()
+            if not source:
+                continue
+            backend = str(camera.get("backend", "")).strip().lower() or (
+                "gstreamer" if kind == "csi" else "v4l2"
+            )
+            label = str(camera.get("name", "")).strip() or source
+            add(_choice_from_source(source, kind=kind, label=label, backend=backend))
+
     if mode == "rtsp":
         add_rtsp_cameras()
         return candidates, discovered
+
+    add_local_cameras()
 
     preferred_source = config.camera_source.strip()
     if preferred_source:

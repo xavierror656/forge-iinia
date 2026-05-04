@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QComboBox,
@@ -19,6 +20,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from ui.icons import icon as _icon
 
 
 TARGET_GPIO = "gpio"
@@ -36,6 +39,7 @@ class AutoAssignDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Auto-asignar por patrón")
+        self.setWindowIcon(_icon("shuffle", size=24))
         self.resize(500, 520)
         self._all_labels = list(labels)
 
@@ -61,9 +65,9 @@ class AutoAssignDialog(QDialog):
 
         self.target_combo = QComboBox()
         for port in gpio_options:
-            self.target_combo.addItem(f"GPIO · {port}", (TARGET_GPIO, port))
+            self.target_combo.addItem(_icon("plug", size=16), f"GPIO · {port}", (TARGET_GPIO, port))
         for cam_id, cam_name in camera_options:
-            self.target_combo.addItem(f"Cámara · {cam_name} (#{cam_id})", (TARGET_CAMERA, cam_id))
+            self.target_combo.addItem(_icon("camera-video", size=16), f"Cámara · {cam_name} (#{cam_id})", (TARGET_CAMERA, cam_id))
 
         form.addRow("Patrón", self.pattern)
         form.addRow("Modo", mode_box)
@@ -79,6 +83,10 @@ class AutoAssignDialog(QDialog):
         layout.addWidget(self.match_list, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+        if (ok_button := buttons.button(QDialogButtonBox.StandardButton.Ok)) is not None:
+            ok_button.setIcon(_icon("check-lg", size=16))
+        if (cancel_button := buttons.button(QDialogButtonBox.StandardButton.Cancel)) is not None:
+            cancel_button.setIcon(_icon("x-lg", size=16))
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Asignar")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)

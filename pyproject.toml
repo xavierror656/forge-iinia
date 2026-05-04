@@ -1,0 +1,66 @@
+[project]
+name = "edgevision-control-hub"
+version = "0.1.0"
+description = "Edge desktop hub bridging Forge with on-device inference and GPIO control."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PyQt6>=6.7",
+    "numpy>=1.26",
+    "opencv-python>=4.10",
+    "ultralytics>=8.3",
+    "PyYAML>=6.0",
+    "gpiozero>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pytest>=8.0",
+    "pre-commit>=3.7",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = [".venv", "__pycache__", "captures"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "SIM",  # simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",   # line too long — long literal strings in UI text are OK
+    "B008",   # Qt frequently uses default arg constructors
+    "SIM105", # contextlib.suppress is not always more readable than try/except/pass
+    "SIM108", # ternary form would push URL composition past readability
+]
+
+[tool.ruff.lint.per-file-ignores]
+"main.py" = ["E402"]
+"tests/*" = ["S101"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+files = ["core"]
+exclude = "(^|/)(\\.venv|__pycache__|captures|ui|main\\.py)"
+
+[[tool.mypy.overrides]]
+module = ["yaml", "cv2", "PyQt6.*", "ultralytics.*", "gpiozero", "gpiozero.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

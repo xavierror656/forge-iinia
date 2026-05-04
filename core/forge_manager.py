@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import base64
 import json
+from pathlib import Path
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
+
+from core.api_errors import ForgeAPIError, NetworkError
+from core.http_retry import call_with_retry
 
 
 @dataclass(slots=True)
@@ -38,11 +41,12 @@ class ForgeManager:
     scheme can vary between deployments.
     """
 
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, *, retry_attempts: int = 3) -> None:
         self.base_url = self._normalize_base_url(base_url)
         self._token: str | None = None
         self._username: str | None = None
         self._password: str | None = None
+        self._retry_attempts = max(1, int(retry_attempts))
 
     @staticmethod
     def _normalize_base_url(base_url: str) -> str:
@@ -64,11 +68,25 @@ class ForgeManager:
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
         elif self._username and self._password:
-            raw = f"{self._username}:{self._password}".encode("utf-8")
+            raw = f"{self._username}:{self._password}".encode()
             headers["Authorization"] = f"Basic {base64.b64encode(raw).decode('ascii')}"
         return headers
 
     def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+        binary: bool = False,
+    ) -> Any:
+        return call_with_retry(
+            lambda: self._request_once(method, path, query=query, payload=payload, binary=binary),
+            attempts=self._retry_attempts,
+        )
+
+    def _request_once(
         self,
         method: str,
         path: str,
@@ -84,7 +102,7 @@ class ForgeManager:
         if query:
             url = f"{url}?{urllib.parse.urlencode(query)}"
 
-        headers = {"Accept": "application/vnd.cvat+json", **self._auth_headers()}
+        headers = {"Accept": "application/vnd.cvat+json; version=2.0", **self._auth_headers()}
         data = None
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
@@ -104,7 +122,9 @@ class ForgeManager:
                     return {"raw": body.decode("utf-8", errors="ignore")}
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"Forge API error {exc.code}: {body}") from exc
+            raise ForgeAPIError(exc.code, body, endpoint=path, method=method) from exc
+        except urllib.error.URLError as exc:
+            raise NetworkError(str(exc.reason), endpoint=path, method=method) from exc
 
     @staticmethod
     def _items(payload: Any) -> list[dict[str, Any]]:
@@ -130,6 +150,15 @@ class ForgeManager:
             else:
                 next_path = None
         return items
+
+    def ping(self) -> dict[str, Any]:
+        """Cheap call to verify the URL + credentials are good.
+
+        Returns ``{"ok": True}`` on success or raises ``ForgeAPIError`` /
+        ``NetworkError`` so callers can show the right message.
+        """
+        self._request("GET", "/api/projects", query={"page_size": 1})
+        return {"ok": True}
 
     def list_projects(self) -> list[ForgeProject]:
         items = self._collect_items("/api/projects")
@@ -177,7 +206,30 @@ class ForgeManager:
         return payload if isinstance(payload, dict) else {"raw": payload}
 
     def project_preview(self, project_id: int) -> bytes:
-        return self._request("GET", f"/api/projects/{project_id}/preview", binary=True)
+        return bytes(self._request("GET", f"/api/projects/{project_id}/preview", binary=True))
+
+    def download_asset(self, asset_uuid: str, target_dir: str | Path, *, filename: str = "forge_model.pt") -> Path:
+        target_root = Path(target_dir)
+        target_root.mkdir(parents=True, exist_ok=True)
+        safe_name = Path(filename).name or "forge_model.pt"
+        if not safe_name.endswith(".pt"):
+            safe_name = f"{safe_name}.pt"
+        data = bytes(self._request("GET", f"/api/assets/{asset_uuid.strip()}", binary=True))
+        if not data:
+            raise RuntimeError(f"Forge asset {asset_uuid} returned an empty response")
+        path = target_root / safe_name
+        path.write_bytes(data)
+        return path
+
+    def download_project_model(self, project_id: int, target_dir: str | Path) -> Path:
+        target_root = Path(target_dir)
+        target_root.mkdir(parents=True, exist_ok=True)
+        data = bytes(self._request("GET", f"/api/projects/{project_id}/model/download", binary=True))
+        if not data:
+            raise RuntimeError(f"Forge project {project_id} model download returned an empty response")
+        path = target_root / f"forge_project_{project_id}.pt"
+        path.write_bytes(data)
+        return path
 
     def create_camera(self, payload: dict[str, Any]) -> dict[str, Any]:
         response = self._request("POST", "/api/cameras", payload=payload)

@@ -1,0 +1,28 @@
+[Unit]
+Description=EdgeVision Control Hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=edgevision
+Group=edgevision
+WorkingDirectory=/opt/edgevision
+EnvironmentFile=-/opt/edgevision/.env
+ExecStart=/opt/edgevision/.venv/bin/python /opt/edgevision/main.py
+ExecStartPre=/opt/edgevision/.venv/bin/python /opt/edgevision/main.py --health
+Restart=on-failure
+RestartSec=5
+WatchdogSec=30
+TimeoutStopSec=10
+KillSignal=SIGTERM
+
+# Hardening
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/opt/edgevision/captures /opt/edgevision/configs /opt/edgevision/models
+
+[Install]
+WantedBy=multi-user.target

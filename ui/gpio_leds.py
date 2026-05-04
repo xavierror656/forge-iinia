@@ -6,6 +6,8 @@ from PyQt6.QtCore import QPropertyAnimation, QTimer, Qt, pyqtProperty
 from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
+from ui.icons import icon as _icon
+
 
 class _Led(QWidget):
     def __init__(self, port: str, parent: QWidget | None = None) -> None:
@@ -57,9 +59,18 @@ class GPIOLedStrip(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(2)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
+        title_icon = QLabel()
+        title_icon.setFixedSize(14, 14)
+        title_icon.setPixmap(_icon("plug", size=14, color="muted").pixmap(14, 14))
         title = QLabel("GPIO live")
         title.setStyleSheet("color:#9fb2c8; font-size:11px;")
-        outer.addWidget(title)
+        header.addWidget(title_icon)
+        header.addWidget(title)
+        header.addStretch(1)
+        outer.addLayout(header)
         strip = QHBoxLayout()
         strip.setSpacing(2)
         strip.setContentsMargins(0, 0, 0, 0)

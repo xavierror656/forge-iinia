@@ -49,14 +49,14 @@ def validate(
             ))
 
     if cameras is not None:
-        for cam_id, name in cameras.items():
-            assigned = camera_assignments.get(str(cam_id), [])
+        for camera_id, name in cameras.items():
+            assigned = camera_assignments.get(str(camera_id), [])
             if not assigned:
                 out.append(Warning(
                     severity="info",
                     code="camera_empty",
                     message=f"Cámara '{name}' no tiene labels asignadas",
-                    target=str(cam_id),
+                    target=str(camera_id),
                 ))
 
     for label in label_set:

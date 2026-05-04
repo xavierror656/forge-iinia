@@ -12,8 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-
 HardwareKind = Literal["jetson", "raspberry", "development"]
+UIProfile = Literal["multi", "single", "desktop"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +29,7 @@ class HardwareInfo:
     gstreamer_pipeline: str
     recommended_model_format: str
     deployment_note: str
+    ui_profile: UIProfile
 
 
 class HardwareProvider(abc.ABC):
@@ -73,6 +74,7 @@ class JetsonProvider(HardwareProvider):
             ),
             recommended_model_format=".engine",
             deployment_note="Jetson: prefer TensorRT engine exports and GStreamer with nvarguscamerasrc.",
+            ui_profile="multi",
         )
 
     def temperature_sources(self) -> tuple[str, ...]:
@@ -105,6 +107,7 @@ class RaspberryProvider(HardwareProvider):
             ),
             recommended_model_format=".imx",
             deployment_note="Raspberry Pi AI Camera: prefer IMX500 exports; otherwise use v4l2src for development.",
+            ui_profile="single",
         )
 
     def temperature_sources(self) -> tuple[str, ...]:
@@ -135,6 +138,7 @@ class DevelopmentProvider(HardwareProvider):
             ),
             recommended_model_format=".pt/.onnx",
             deployment_note="Development: use local files, webcam, or prerecorded videos for validation.",
+            ui_profile="desktop",
         )
 
     def temperature_sources(self) -> tuple[str, ...]:
@@ -150,7 +154,14 @@ class DevelopmentProvider(HardwareProvider):
 class HardwareManager:
     """Factory and convenience methods for runtime hardware selection."""
 
-    def __init__(self, forced_kind: HardwareKind | None = None) -> None:
+    def __init__(
+        self,
+        forced_kind: HardwareKind | None = None,
+        *,
+        force_simulation: bool = False,
+    ) -> None:
+        if force_simulation:
+            forced_kind = "development"
         self._provider = self._create_provider(forced_kind)
 
     @staticmethod
@@ -212,3 +223,7 @@ class HardwareManager:
 
     def is_simulation(self) -> bool:
         return self._provider.is_simulation()
+
+    @property
+    def ui_profile(self) -> UIProfile:
+        return self._provider.info().ui_profile

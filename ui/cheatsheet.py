@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QVBoxLayout
+
+from ui.icons import icon as _icon
 
 
 SHORTCUTS = [
@@ -24,6 +27,7 @@ class ShortcutsDialog(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Atajos de teclado")
+        self.setWindowIcon(_icon("keyboard", size=24))
         self.resize(420, 360)
         layout = QVBoxLayout(self)
         title = QLabel("<b>Atajos disponibles</b>")
@@ -36,6 +40,8 @@ class ShortcutsDialog(QDialog):
             layout.addWidget(row)
         layout.addStretch(1)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        if (close_button := buttons.button(QDialogButtonBox.StandardButton.Close)) is not None:
+            close_button.setIcon(_icon("x-lg", size=16))
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         layout.addWidget(buttons)

@@ -6,12 +6,21 @@ from PyQt6.QtCore import QPropertyAnimation, QTimer, Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QGraphicsOpacityEffect, QHBoxLayout, QLabel, QWidget
 
+from ui.icons import icon as _icon
+
 
 SEVERITY_STYLE = {
     "info": ("#1b2028", "#9fb2c8"),
     "success": ("#1d2f24", "#62d2a2"),
     "warn": ("#332714", "#e3b341"),
     "error": ("#3a1a1f", "#e35f6a"),
+}
+
+SEVERITY_ICON = {
+    "info": ("info-circle", "info"),
+    "success": ("check-circle", "accent"),
+    "warn": ("exclamation-triangle", "warning"),
+    "error": ("x-circle", "danger"),
 }
 
 
@@ -26,9 +35,14 @@ class _Toast(QWidget):
         )
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        icon_name, icon_color = SEVERITY_ICON.get(severity, SEVERITY_ICON["info"])
+        icon_label = QLabel()
+        icon_label.setFixedSize(16, 16)
+        icon_label.setPixmap(_icon(icon_name, size=16, color=icon_color).pixmap(16, 16))
         label = QLabel(message)
         label.setWordWrap(True)
         label.setStyleSheet(f"color:{fg};")
+        layout.addWidget(icon_label)
         layout.addWidget(label)
 
         self._effect = QGraphicsOpacityEffect(self)

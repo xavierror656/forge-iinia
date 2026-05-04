@@ -6,6 +6,8 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QWidget
 
+from ui.icons import icon as _icon
+
 
 class ConnectionIndicator(QWidget):
     def __init__(self, name: str, parent: QWidget | None = None) -> None:
@@ -19,6 +21,10 @@ class ConnectionIndicator(QWidget):
         self._dot = _Dot(self)
         self._label = QLabel(f"{name}: —")
         self._label.setStyleSheet("color:#9fb2c8;")
+        self._icon_label = QLabel()
+        self._icon_label.setFixedSize(16, 16)
+        self._icon_label.setPixmap(_icon("question-circle", size=16, color="muted").pixmap(16, 16))
+        layout.addWidget(self._icon_label)
         layout.addWidget(self._dot)
         layout.addWidget(self._label)
 
@@ -27,15 +33,22 @@ class ConnectionIndicator(QWidget):
         self._latency_ms = latency_ms
         if state == "ok":
             color = QColor("#62d2a2")
+            icon_name = "check-circle"
+            icon_color = "accent"
             text = f"{self._name}: {latency_ms:.0f} ms" if latency_ms is not None else f"{self._name}: OK"
         elif state == "error":
             color = QColor("#e35f6a")
+            icon_name = "x-circle"
+            icon_color = "danger"
             text = f"{self._name}: error"
             if detail:
                 text += f" ({detail})"
         else:
             color = QColor("#7a8392")
+            icon_name = "question-circle"
+            icon_color = "muted"
             text = f"{self._name}: —"
+        self._icon_label.setPixmap(_icon(icon_name, size=16, color=icon_color).pixmap(16, 16))
         self._dot.set_color(color)
         self._label.setText(text)
         self._label.setToolTip(detail or text)

@@ -5,9 +5,9 @@ from __future__ import annotations
 import csv
 import io
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import yaml
 
@@ -24,7 +24,7 @@ def export_yaml(bundle: ConfigBundle) -> str:
         "camera_assignments": bundle.cameras,
         "gpio_assignments": bundle.gpios,
     }
-    return yaml.safe_dump(payload, sort_keys=True, allow_unicode=True)
+    return str(yaml.safe_dump(payload, sort_keys=True, allow_unicode=True))
 
 
 def export_json(bundle: ConfigBundle) -> str:

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import QDialog, QLineEdit, QListWidget, QListWidgetItem, QVBoxLayout, QWidget
+
+from ui.icons import icon as _icon
 
 
 @dataclass
@@ -17,12 +18,12 @@ class PaletteItem:
     payload: object
 
 
-KIND_PREFIX = {
-    "label": "🏷",
-    "camera": "📷",
-    "line": "↔",
-    "port": "🔌",
-    "project": "📁",
+KIND_ICONS = {
+    "label": ("tag", "accent"),
+    "camera": ("camera-video", "info"),
+    "line": ("diagram-3", "primary"),
+    "port": ("plug", "warning"),
+    "project": ("folder", "primary"),
 }
 
 
@@ -32,6 +33,7 @@ class CommandPalette(QDialog):
     def __init__(self, items: list[PaletteItem], parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Buscar")
+        self.setWindowIcon(_icon("search", size=24))
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setModal(True)
         self.resize(560, 440)
@@ -54,6 +56,7 @@ class CommandPalette(QDialog):
         font = QFont()
         font.setPointSize(11)
         self.search.setFont(font)
+        self.search.addAction(_icon("search", size=16), QLineEdit.ActionPosition.LeadingPosition)
 
         self.list = QListWidget()
         self.list.itemActivated.connect(self._emit_current)
@@ -88,8 +91,9 @@ class CommandPalette(QDialog):
         for item in self._items:
             if needle and needle not in item.text.lower() and needle not in item.kind.lower():
                 continue
-            prefix = KIND_PREFIX.get(item.kind, "·")
-            entry = QListWidgetItem(f"{prefix}  {item.text}")
+            icon_name, color = KIND_ICONS.get(item.kind, ("circle", "muted"))
+            entry = QListWidgetItem(item.text)
+            entry.setIcon(_icon(icon_name, size=16, color=color))
             entry.setData(Qt.ItemDataRole.UserRole, item)
             self.list.addItem(entry)
         if self.list.count():

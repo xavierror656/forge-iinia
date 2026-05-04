@@ -14,13 +14,15 @@ import random
 import traceback
 import queue
 import time
+import urllib.parse
 from threading import Lock
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import cv2
-from PyQt6.QtCore import QObject, QPoint, QRectF, QThread, QTimer, Qt, pyqtSignal
+import numpy as np
+from PyQt6.QtCore import QEvent, QObject, QPoint, QRectF, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtWidgets import (
@@ -45,10 +47,35 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from cvat.cvat_manager import CvatManager
+import logging
+
+from app.state import DetectionState, TelemetrySnapshot
+from app.threads.watchdog import Watchdog
+from app.widgets.video_widget import OpenGLVideoWidget
 from core.async_worker import AsyncWorker
+from core.audit_log import AuditLog
+from core.captures_cleanup import cleanup_captures
+from core.gpio_backend import GPIOBackend, select_backend
+from core.gpio_dispatch import GPIODispatcher
+from core.logging_config import configure as configure_logging
+from core.output_adapters import InferenceOutputDispatcher, InferenceOutputConfig, inference_payload_from_frame
+from core.shutdown import install_signal_handlers
+from core.telemetry_log import TelemetryLog
+
+
+log = logging.getLogger("edgevision")
 from core.config_io import ConfigBundle, filter_known_labels, read_path, write_path
+from core.config_store import (
+    GPIO_ASSIGNMENTS_PATH,
+    get_last_camera_id,
+    get_last_project_id,
+    load_gpio_assignments,
+    save_gpio_assignments,
+    set_last_camera_id,
+    set_last_project_id,
+)
 from core.env_config import read_env_file
+from core.settings import Settings
 from core.hardware_manager import HardwareManager
 from core.forge_manager import ForgeManager
 from core.undo import AssignmentHistory, Snapshot
@@ -66,11 +93,11 @@ from ui.auto_assign import AutoAssignDialog, TARGET_CAMERA, TARGET_GPIO
 from ui.cheatsheet import ShortcutsDialog
 from ui.command_palette import CommandPalette, PaletteItem
 from ui.connection_indicator import ConnectionIndicator
-from ui.cvat_panel import CvatPanel
 from ui.detection_overlay import DetectionHistogram
 from ui.forge_panel import CameraCreateDialog, ForgeConfigDialog, ForgePanel
 from ui.gpio_leds import GPIOLedStrip
 from ui.settings_panel import SettingsDialog, SettingsPanel
+from ui.icons import icon as _icon
 from ui.sparkline import Sparkline
 from ui.toast import ToastManager
 
@@ -78,168 +105,12 @@ from ui.toast import ToastManager
 BRAND_LOGO_PATH = Path(__file__).resolve().parent / "ui" / "iinia_logo.webp"
 
 
-@dataclass(slots=True)
-class TelemetrySnapshot:
-    capture_fps: float = 0.0
-    inference_fps: float = 0.0
-    latency_ms: float = 0.0
-    ram_mb: float = 0.0
-    vram_mb: float = 0.0
-    soc_temp_c: float = 0.0
-    provider_name: str = ""
-
-
-@dataclass(slots=True)
-class DetectionState:
-    label: str
-    consecutive_frames: int = 0
-    threshold: int = 3
-    latched: bool = False
-
-    def register(self, detected: bool) -> bool:
-        if detected:
-            self.consecutive_frames += 1
-        else:
-            self.consecutive_frames = 0
-            self.latched = False
-
-        if self.consecutive_frames >= self.threshold and not self.latched:
-            self.latched = True
-            return True
-
-        return False
-
-
-class OpenGLVideoWidget(QOpenGLWidget):
-    """Low-overhead display widget for the camera stream with detection overlay."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._image: QImage | None = None
-        self._status_text = "Esperando stream..."
-        self._detections: list[dict] = []
-        self._frame_size: tuple[int, int] | None = None
-        self.setMinimumHeight(360)
-
-    def set_frame(self, frame: Any) -> None:
-        self._image = None
-        self._frame_size = None
-        if isinstance(frame, dict):
-            status = frame.get("status") or frame.get("source_label") or frame.get("source") or "Stream activo"
-            self._status_text = str(status)
-            detections = frame.get("detections")
-            if isinstance(detections, list):
-                self._detections = list(detections)
-            image = frame.get("image")
-            if isinstance(image, QImage):
-                self._image = image
-            frame_size = frame.get("frame_size")
-            if isinstance(frame_size, (tuple, list)) and len(frame_size) == 2:
-                try:
-                    self._frame_size = (int(frame_size[0]), int(frame_size[1]))
-                except (TypeError, ValueError):
-                    self._frame_size = None
-        elif isinstance(frame, QImage):
-            self._image = frame
-        else:
-            self._status_text = "Esperando stream..."
-        self.update()
-
-    def set_status(self, text: str) -> None:
-        self._status_text = text
-        self.update()
-
-    def set_detections(self, detections: list[dict]) -> None:
-        self._detections = list(detections)
-        self.update()
-
-    def paintGL(self) -> None:  # noqa: N802
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#111318"))
-        if self._image is not None and not self._image.isNull():
-            scaled = self._image.scaled(
-                self.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            x_offset = (self.width() - scaled.width()) // 2
-            y_offset = (self.height() - scaled.height()) // 2
-            painter.drawImage(QPoint(x_offset, y_offset), scaled)
-
-            img_width = max(1, self._image.width())
-            img_height = max(1, self._image.height())
-            scale_x = scaled.width() / img_width
-            scale_y = scaled.height() / img_height
-
-            for det in self._detections:
-                bbox = det.get("bbox") or (0.1, 0.1, 0.3, 0.3)
-                if not isinstance(bbox, (tuple, list)) or len(bbox) != 4:
-                    continue
-                try:
-                    x1, y1, x2, y2 = (float(value) for value in bbox)
-                except (TypeError, ValueError):
-                    continue
-
-                if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.5:
-                    rect = QRectF(
-                        x_offset + x1 * scaled.width(),
-                        y_offset + y1 * scaled.height(),
-                        (x2 - x1) * scaled.width(),
-                        (y2 - y1) * scaled.height(),
-                    )
-                else:
-                    rect = QRectF(
-                        x_offset + x1 * scale_x,
-                        y_offset + y1 * scale_y,
-                        (x2 - x1) * scale_x,
-                        (y2 - y1) * scale_y,
-                    )
-
-                color_hex = det.get("color") or self._label_color(str(det.get("label", "")))
-                color = QColor(color_hex)
-                if not color.isValid():
-                    color = QColor("#62d2a2")
-                painter.setPen(QPen(color, 2))
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawRect(rect)
-
-                label = str(det.get("label", "")).strip()
-                conf = det.get("confidence", 0.0)
-                text = f"{label}  {conf:.2f}" if label and conf else label
-                if text:
-                    fm = painter.fontMetrics()
-                    tw = fm.horizontalAdvance(text) + 8
-                    th = fm.height() + 4
-                    banner_x = int(max(0, rect.x()))
-                    banner_y = int(max(0, rect.y() - th))
-                    painter.fillRect(QRectF(banner_x, banner_y, tw, th), color)
-                    painter.setPen(QPen(QColor("#0a0c10")))
-                    painter.drawText(QPoint(banner_x + 4, banner_y + th - 4), text)
-
-            painter.setPen(QPen(QColor("#0a0c10")))
-            painter.fillRect(QRectF(12, 12, max(220, painter.fontMetrics().horizontalAdvance(self._status_text) + 20), 26), QColor(0, 0, 0, 150))
-            painter.setPen(QPen(QColor("#e6eaf2")))
-            painter.drawText(QPoint(22, 30), self._status_text)
-        else:
-            painter.setPen(QPen(QColor("#62d2a2")))
-            painter.drawText(self.rect().adjusted(16, 16, -16, -16), 0x84, self._status_text)
-        painter.end()
-
-    @staticmethod
-    def _label_color(label: str) -> str:
-        palette = ["#62d2a2", "#5aa9e6", "#f4b942", "#e66b6b", "#b57ff5", "#7ad3c8"]
-        if not label:
-            return palette[0]
-        index = sum(ord(ch) for ch in label) % len(palette)
-        return palette[index]
-
-
 class InferenceWorker(QThread):
     source_ready = pyqtSignal(dict)
     frame_ready = pyqtSignal(object)
     telemetry_ready = pyqtSignal(dict)
     log_message = pyqtSignal(str)
-    detection_event = pyqtSignal(str, bool)
+    detection_event = pyqtSignal(str, str, bool)
     detections_payload = pyqtSignal(list)
     model_loaded = pyqtSignal(str)
     frozen = pyqtSignal()
@@ -251,6 +122,8 @@ class InferenceWorker(QThread):
         parent: QObject | None = None,
         *,
         source_config: InferenceSourceConfig | None = None,
+        camera_id: str = "primary",
+        forced_choice: VideoSourceChoice | None = None,
     ) -> None:
         super().__init__(parent)
         self._hardware = hardware
@@ -269,6 +142,14 @@ class InferenceWorker(QThread):
         self._source_status = "Esperando stream..."
         self._last_source_signature: tuple[Any, ...] | None = None
         self._read_failures = 0
+        self._camera_id = camera_id
+        self._forced_choice = forced_choice
+        self._model: Any = None
+        self._pending_model_signature: tuple[float, int] | None = None
+
+    @property
+    def camera_id(self) -> str:
+        return self._camera_id
 
     def set_known_labels(self, labels: list[dict]) -> None:
         with self._known_lock:
@@ -335,6 +216,76 @@ class InferenceWorker(QThread):
             )
         return detections
 
+    def _simulation_frame(self) -> Any:
+        frame = np.zeros((736, 1280, 3), dtype=np.uint8)
+        frame[:, :] = (18, 20, 26)
+        cv2.rectangle(frame, (70, 80), (1210, 656), (44, 54, 68), 2)
+        cv2.rectangle(frame, (120, 140), (430, 520), (70, 90, 115), -1)
+        cv2.rectangle(frame, (520, 190), (860, 560), (45, 105, 82), -1)
+        cv2.rectangle(frame, (940, 230), (1130, 470), (98, 70, 48), -1)
+        cv2.putText(
+            frame,
+            "SIMULATION FRAME - REAL MODEL INPUT",
+            (90, 55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (210, 220, 235),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            "No camera signal. Running .pt inference on this synthetic frame.",
+            (90, 705),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (135, 150, 170),
+            2,
+            cv2.LINE_AA,
+        )
+        return frame
+
+    def _detections_from_model(self, frame: Any, *, allow_simulated: bool = False) -> list[dict]:
+        if self._model is None:
+            return self._simulate_detections() if allow_simulated else []
+        if frame is None:
+            frame = self._simulation_frame()
+        try:
+            results = self._model.predict(frame, verbose=False, conf=0.05)
+        except Exception as exc:
+            self.log_message.emit(f"Model inference failed, using simulation: {exc}")
+            return self._simulate_detections()
+        if not results:
+            return []
+        result = results[0]
+        boxes = getattr(result, "boxes", None)
+        if boxes is None:
+            return []
+        names = getattr(result, "names", {}) or getattr(self._model, "names", {}) or {}
+        detections: list[dict] = []
+        try:
+            xyxy = boxes.xyxy.cpu().tolist()
+            cls_values = boxes.cls.cpu().tolist()
+            conf_values = boxes.conf.cpu().tolist()
+        except Exception:
+            return []
+        for bbox, cls_id, confidence in zip(xyxy, cls_values, conf_values):
+            try:
+                class_index = int(cls_id)
+            except (TypeError, ValueError):
+                class_index = -1
+            label = str(names.get(class_index, class_index if class_index >= 0 else "object"))
+            detections.append(
+                {
+                    "label": label,
+                    "confidence": round(float(confidence), 4),
+                    "bbox": [round(float(value), 2) for value in bbox[:4]],
+                    "class_id": class_index,
+                    "color": self._color_for_label(label),
+                }
+            )
+        return detections
+
     def _open_capture(self, choice: VideoSourceChoice) -> cv2.VideoCapture | None:
         backend = capture_backend_for(choice)
         source: Any = choice.source
@@ -386,6 +337,23 @@ class InferenceWorker(QThread):
         if self._capture is not None:
             return
 
+        if self._forced_choice is not None:
+            self._discovered_sources = []
+            chosen: VideoSourceChoice | None = None
+            capture = self._open_capture(self._forced_choice)
+            if capture is not None:
+                chosen = self._forced_choice
+            self._capture = capture
+            self._active_choice = chosen
+            self._read_failures = 0
+            self._source_status = (
+                f"{chosen.kind.upper()} · {chosen.label}" if chosen else "Esperando stream..."
+            )
+            self._emit_source_state(
+                chosen, active=bool(capture), discovered=self._discovered_sources
+            )
+            return
+
         candidates, discovered = resolve_video_source_candidates(self._source_config, self._hardware)
         self._discovered_sources = discovered
 
@@ -431,8 +399,11 @@ class InferenceWorker(QThread):
                 continue
             seen_names.add(name)
             state = self._states.get(name)
+            if state is None:
+                state = DetectionState(label=name, threshold=3)
+                self._states[name] = state
             if state and state.register(True):
-                self.detection_event.emit(name, True)
+                self.detection_event.emit(name, self._camera_id, True)
         for name, state in list(self._states.items()):
             if name not in seen_names:
                 state.register(False)
@@ -443,28 +414,67 @@ class InferenceWorker(QThread):
     def heartbeat(self) -> float:
         return self._last_heartbeat
 
+    def set_model_path(self, path: str | Path | None) -> None:
+        self._model_path = Path(path) if path else None
+        self._last_model_mtime = 0.0
+        self._pending_model_signature = None
+
     def _load_model(self) -> None:
         if not self._model_path:
+            self._model = None
             self.log_message.emit("No model path provided. Running in simulation mode.")
             self.model_loaded.emit("simulation")
             return
 
         if not self._model_path.exists():
+            self._model = None
             self.log_message.emit(f"Model not found: {self._model_path}")
             self.model_loaded.emit("missing")
             return
 
-        self._last_model_mtime = self._model_path.stat().st_mtime
+        try:
+            from ultralytics import YOLO  # type: ignore[import-not-found]
+        except Exception as exc:
+            self._model = None
+            self.log_message.emit(f"ultralytics unavailable, staying in simulation: {exc}")
+            self.model_loaded.emit("simulation")
+            return
+
+        try:
+            self._model = YOLO(str(self._model_path))
+        except Exception as exc:
+            self._model = None
+            self.log_message.emit(f"Model load failed: {exc}")
+            self.model_loaded.emit("error")
+            return
+
+        stat = self._model_path.stat()
+        self._last_model_mtime = stat.st_mtime
+        self._pending_model_signature = None
         self.log_message.emit(f"Model loaded: {self._model_path.name}")
         self.model_loaded.emit(str(self._model_path))
 
     def _maybe_hot_reload(self) -> None:
+        """Reload the model if the file changed and looks stable.
+
+        We require two consecutive checks with the same (mtime, size) before
+        swapping so a partial copy ``YOLO(...)`` mid-flight never gets loaded.
+        """
         if not self._model_path or not self._model_path.exists():
             return
-        current_mtime = self._model_path.stat().st_mtime
-        if current_mtime > self._last_model_mtime:
+        try:
+            stat = self._model_path.stat()
+        except OSError:
+            return
+        signature = (stat.st_mtime, stat.st_size)
+        if signature[0] <= self._last_model_mtime:
+            self._pending_model_signature = None
+            return
+        if self._pending_model_signature == signature:
             self.log_message.emit(f"Hot reload triggered for {self._model_path.name}")
             self._load_model()
+        else:
+            self._pending_model_signature = signature
 
     def _run_inference_step(self) -> None:
         self._last_heartbeat = time.monotonic()
@@ -476,11 +486,13 @@ class InferenceWorker(QThread):
         start = time.perf_counter()
         image: QImage | None = None
         frame_size: tuple[int, int] | None = None
+        raw_frame: Any = None
         simulation = self._capture is None
 
         if self._capture is not None:
             ok, frame = self._capture.read()
             if ok and frame is not None:
+                raw_frame = frame
                 image = self._frame_to_qimage(frame)
                 if image is not None:
                     frame_size = (int(frame.shape[1]), int(frame.shape[0]))
@@ -496,7 +508,14 @@ class InferenceWorker(QThread):
                     self._emit_source_state(None, active=False, discovered=self._discovered_sources)
                 simulation = True
 
-        detections = self._simulate_detections()
+        if raw_frame is None and simulation:
+            raw_frame = self._simulation_frame()
+            image = self._frame_to_qimage(raw_frame)
+            frame_size = (int(raw_frame.shape[1]), int(raw_frame.shape[0]))
+            if self._model is not None:
+                self._source_status = "Simulación · inferencia real sobre frame sintético"
+
+        detections = self._detections_from_model(raw_frame, allow_simulated=simulation)
         self.detections_payload.emit(detections)
         self._update_detection_states(detections)
 
@@ -544,76 +563,105 @@ class InferenceWorker(QThread):
 class GPIOWorker(QThread):
     log_message = pyqtSignal(str)
 
-    def __init__(self, hardware: HardwareManager, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        hardware: HardwareManager,
+        parent: QObject | None = None,
+        *,
+        audit_log: AuditLog | None = None,
+        dedupe_seconds: float = 1.0,
+        backend: GPIOBackend | None = None,
+        pulse_seconds: float = 0.1,
+    ) -> None:
         super().__init__(parent)
         self._hardware = hardware
-        self._events: "queue.Queue[tuple[str, bool]]" = queue.Queue()
+        self._events: "queue.Queue[tuple[str, str, bool]]" = queue.Queue()
         self._stop_requested = False
         self._simulation = hardware.is_simulation()
-        self._assignments: dict[str, str] = {}
-        self._assignments_lock = Lock()
+        self._dispatcher = GPIODispatcher(dedupe_seconds=dedupe_seconds)
+        self._dispatcher_lock = Lock()
+        self._audit = audit_log
+        self._backend = backend or select_backend(simulation=self._simulation)
+        self._pulse_seconds = max(0.0, float(pulse_seconds))
 
     def request_stop(self) -> None:
         self._stop_requested = True
 
-    def enqueue_detection(self, label: str, active: bool) -> None:
-        self._events.put((label, active))
+    def enqueue_detection(self, label: str, camera_id: str, active: bool) -> None:
+        self._events.put((label, camera_id, active))
 
     def set_assignments(self, assignments: dict[str, str]) -> None:
-        with self._assignments_lock:
-            self._assignments = dict(assignments)
+        with self._dispatcher_lock:
+            self._dispatcher.set_assignments(assignments)
 
     def run(self) -> None:
         while not self._stop_requested:
             try:
-                label, active = self._events.get(timeout=0.25)
+                label, camera_id, active = self._events.get(timeout=0.25)
             except queue.Empty:
                 continue
 
-            with self._assignments_lock:
-                port = self._assignments.get(label, "")
+            with self._dispatcher_lock:
+                decision = self._dispatcher.decide(label, camera_id, active)
 
+            if not decision.fire:
+                if decision.reason == "deduped" and self._audit is not None:
+                    try:
+                        self._audit.record(
+                            kind="gpio_dedup",
+                            label=label,
+                            active=active,
+                            camera_id=camera_id,
+                        )
+                    except OSError:
+                        pass
+                continue
+
+            port = decision.port
+            cam_suffix = f" (cam {camera_id})" if camera_id else ""
+            driven = False
+            if port and active:
+                driven = self._backend.pulse(port, self._pulse_seconds)
+            backend_tag = self._backend.name
             if self._simulation:
                 if port:
-                    self.log_message.emit(f"[SIM] GPIO event: {label} -> {active} on {port}")
+                    self.log_message.emit(f"[SIM] GPIO event: {label} -> {active} on {port}{cam_suffix}")
                 else:
-                    self.log_message.emit(f"[SIM] GPIO event: {label} -> {active}")
+                    self.log_message.emit(f"[SIM] GPIO event: {label} -> {active}{cam_suffix}")
             else:
+                outcome = "ok" if driven else "no-driver"
                 if port:
-                    self.log_message.emit(f"GPIO event: {label} -> {active} on {port} via {self._hardware.info.gpio_backend}")
+                    self.log_message.emit(
+                        f"GPIO event: {label} -> {active} on {port} via {backend_tag} ({outcome}){cam_suffix}"
+                    )
                 else:
-                    self.log_message.emit(f"GPIO event: {label} -> {active} via {self._hardware.info.gpio_backend}")
+                    self.log_message.emit(
+                        f"GPIO event: {label} -> {active} via {backend_tag}{cam_suffix}"
+                    )
 
-
-class Watchdog(QThread):
-    restart_requested = pyqtSignal()
-    log_message = pyqtSignal(str)
-
-    def __init__(self, inference_worker: InferenceWorker, timeout_s: float = 2.5, parent: QObject | None = None) -> None:
-        super().__init__(parent)
-        self._inference_worker = inference_worker
-        self._timeout_s = timeout_s
-        self._stop_requested = False
-
-    def request_stop(self) -> None:
-        self._stop_requested = True
-
-    def run(self) -> None:
-        while not self._stop_requested:
-            age = time.monotonic() - self._inference_worker.heartbeat()
-            if age > self._timeout_s:
-                self.log_message.emit("Watchdog detected inference freeze. Restart requested.")
-                self.restart_requested.emit()
-                return
-            self.msleep(500)
+            if self._audit is not None:
+                try:
+                    self._audit.record(
+                        kind="gpio_simulated" if self._simulation else "gpio",
+                        label=label,
+                        active=active,
+                        port=port,
+                        camera_id=camera_id,
+                        extra={"backend": self._backend.name, "driven": driven},
+                    )
+                except OSError as exc:
+                    self.log_message.emit(f"Audit log write failed: {exc}")
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, hardware: HardwareManager) -> None:
+    def __init__(self, hardware: HardwareManager, settings: Settings | None = None) -> None:
         super().__init__()
         self._hardware = hardware
-        self._cvat = CvatManager("https://app.cvat.ai")
-        self._forge = ForgeManager("https://forge.iinia.ai/api/swagger/")
+        self._settings = settings or Settings.load()
+        self._forge = ForgeManager(
+            self._settings.forge_url or "https://forge.iinia.ai/api/swagger/",
+            retry_attempts=self._settings.http_retry_attempts,
+        )
         self._workers: list[AsyncWorker] = []
         self._camera_assignments: dict[str, list[str]] = self._load_local_assignments()
         self._gpio_assignments: dict[str, dict[str, str]] = self._load_gpio_assignments()
@@ -621,14 +669,92 @@ class MainWindow(QMainWindow):
         self._known_labels: list[dict] = []
         self._latest_source_state: dict[str, Any] = {}
         self._latest_telemetry: dict[str, Any] = {}
-        self._inference_worker = self._create_inference_worker()
-        self._gpio_worker = GPIOWorker(hardware, self)
-        self._watchdog = Watchdog(self._inference_worker, parent=self)
+        self._model_path = self._resolve_model_path(self._settings.model_path)
+        self._model_download_inflight = False
+        capture_dir = self._settings.capture_path
+        self._audit_log = AuditLog(capture_dir / "events.jsonl")
+        self._telemetry_log = TelemetryLog(capture_dir / "telemetry.jsonl")
+        self._output_dispatcher = InferenceOutputDispatcher(
+            self._settings.output_config,
+            log=lambda message: self._append_log(message),
+        )
+        try:
+            removed, freed = cleanup_captures(capture_dir)
+            if removed:
+                log.info("captures cleanup: removed %d files (%d bytes)", removed, freed)
+        except OSError as exc:
+            log.warning("captures cleanup failed: %s", exc)
+        self._inference_workers: list[InferenceWorker] = self._create_inference_workers()
+        self._inference_worker: InferenceWorker = self._inference_workers[0]
+        self._gpio_worker = GPIOWorker(
+            hardware,
+            self,
+            audit_log=self._audit_log,
+            dedupe_seconds=self._settings.gpio_dedupe_seconds,
+            pulse_seconds=self._settings.gpio_pulse_seconds,
+        )
+        self._watchdogs: list[Watchdog] = [
+            Watchdog(worker, timeout_s=self._settings.watchdog_timeout_seconds, parent=self)
+            for worker in self._inference_workers
+        ]
+        self._watchdog: Watchdog = self._watchdogs[0]
         self._build_ui()
+        self._toast = ToastManager(self)
+        self._assignment_history = AssignmentHistory(on_apply=self._restore_snapshot)
+        self._assignment_history.initialize(self._camera_assignments, self._gpio_assignments)
+        self._install_global_shortcuts()
         self._apply_env_settings(read_env_file(Path(self.settings_panel.env_file.text().strip() or ".env")))
         self._wire_threads()
         self._start_threads()
         self._bootstrap_from_env()
+
+    def _install_global_shortcuts(self) -> None:
+        help_shortcut = QShortcut(QKeySequence("F1"), self)
+        help_shortcut.activated.connect(self._open_shortcuts_dialog)
+        question = QShortcut(QKeySequence(Qt.Key.Key_Question), self)
+        question.activated.connect(self._open_shortcuts_dialog)
+        undo = QShortcut(QKeySequence("Ctrl+Z"), self)
+        undo.activated.connect(self._undo_assignment)
+        redo = QShortcut(QKeySequence("Ctrl+Y"), self)
+        redo.activated.connect(self._redo_assignment)
+
+    def _open_shortcuts_dialog(self) -> None:
+        ShortcutsDialog(self).exec()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if hasattr(self, "_toast"):
+            self._toast.reflow()
+
+    def _undo_assignment(self) -> None:
+        label = self._assignment_history.undo()
+        if label is None:
+            self._toast.show("Nada que deshacer", severity="info", ttl_ms=2000)
+            return
+        self._toast.show(f"Deshecho: {label}", severity="success", ttl_ms=2500)
+
+    def _redo_assignment(self) -> None:
+        label = self._assignment_history.redo()
+        if label is None:
+            self._toast.show("Nada que rehacer", severity="info", ttl_ms=2000)
+            return
+        self._toast.show(f"Rehecho: {label}", severity="success", ttl_ms=2500)
+
+    def _push_assignment_history(self, label: str) -> None:
+        if hasattr(self, "_assignment_history"):
+            self._assignment_history.push(label, self._camera_assignments, self._gpio_assignments)
+
+    def _restore_snapshot(self, snapshot: Snapshot) -> None:
+        self._gpio_assignments = {k: dict(v) for k, v in snapshot.gpios.items()}
+        self._camera_assignments = {k: list(v) for k, v in snapshot.cameras.items()}
+        self._save_gpio_assignments()
+        self._save_local_assignments()
+        project_id = self.forge_panel.selected_project_id()
+        if project_id is not None:
+            current = dict(self._gpio_assignments.get(str(project_id), {}))
+            self.forge_panel.set_gpio_assignments(current)
+            self._gpio_worker.set_assignments(current)
+        self._refresh_label_assignment_index()
 
     def _report_error(self, context: str, exc: Exception) -> None:
         message = f"{context}: {exc}"
@@ -642,14 +768,89 @@ class MainWindow(QMainWindow):
             self._report_error(context, exc)
             self._append_log(traceback.format_exc())
 
+    def _resolve_active_sources(self) -> list[VideoSourceChoice]:
+        """Decide which sources to actually run inference on simultaneously.
+
+        Rule: each enabled RTSP camera or each *configured* enabled local
+        (USB/CSI) camera gets its own worker when there are 2+ of them.
+        Auto-discovered local devices are not promoted to tiles to avoid
+        spawning workers for /dev/videoN nodes that can't be captured.
+        """
+        config = self._video_source_config
+        mode = (config.mode or "auto").strip().lower()
+        if mode == "rtsp":
+            candidates, _ = resolve_video_source_candidates(config, self._hardware)
+            rtsp_candidates = [c for c in candidates if c.kind == "rtsp"]
+            return rtsp_candidates if len(rtsp_candidates) > 1 else []
+
+        local_candidates: list[VideoSourceChoice] = []
+        for item in config.local_cameras:
+            if not isinstance(item, dict):
+                continue
+            if not bool(item.get("enabled", True)):
+                continue
+            kind = str(item.get("kind", "webcam")).strip().lower() or "webcam"
+            if mode == "webcam" and kind != "webcam":
+                continue
+            if mode == "csi" and kind != "csi":
+                continue
+            source = str(item.get("source", "")).strip()
+            if not source:
+                continue
+            backend = str(item.get("backend", "")).strip().lower() or (
+                "gstreamer" if kind == "csi" else "v4l2"
+            )
+            label = str(item.get("name", "")).strip() or source
+            local_candidates.append(
+                VideoSourceChoice(kind=kind, label=label, source=source, backend=backend, available=True)
+            )
+        return local_candidates if len(local_candidates) > 1 else []
+
+    @staticmethod
+    def _resolve_model_path(path: Path) -> Path | None:
+        if path.is_file():
+            return path
+        if not path.exists() or not path.is_dir():
+            return None
+        candidates = sorted(path.glob("*.pt"), key=lambda candidate: candidate.stat().st_mtime, reverse=True)
+        return candidates[0] if candidates else None
+
+    def _create_inference_workers(self) -> list[InferenceWorker]:
+        active = self._resolve_active_sources()
+        if not active:
+            primary = InferenceWorker(
+                self._model_path,
+                self._hardware,
+                self,
+                source_config=self._video_source_config,
+                camera_id="primary",
+            )
+            if self._known_labels:
+                primary.set_known_labels(self._known_labels)
+            return [primary]
+
+        workers: list[InferenceWorker] = []
+        for index, choice in enumerate(active):
+            cam_id = choice.label.strip() or f"cam-{index + 1}"
+            worker = InferenceWorker(
+                self._model_path,
+                self._hardware,
+                self,
+                source_config=self._video_source_config,
+                camera_id=cam_id,
+                forced_choice=choice,
+            )
+            if self._known_labels:
+                worker.set_known_labels(self._known_labels)
+            workers.append(worker)
+        return workers
+
     def _create_inference_worker(self) -> InferenceWorker:
-        worker = InferenceWorker(None, self._hardware, self, source_config=self._video_source_config)
-        if self._known_labels:
-            worker.set_known_labels(self._known_labels)
-        return worker
+        return self._create_inference_workers()[0]
 
     def _build_ui(self) -> None:
         self.setWindowTitle("EdgeVision Control Hub")
+        self.setWindowIcon(_icon("app", size=24))
         self.resize(1400, 900)
 
         central = QWidget(self)
@@ -665,25 +866,30 @@ class MainWindow(QMainWindow):
             self.brand_logo.setToolTip("INIIA")
         else:
             self.brand_logo.hide()
+        self.hardware_icon = QLabel()
+        self.hardware_icon.setFixedSize(16, 16)
+        self.hardware_icon.setPixmap(_icon("cpu", size=16, color="muted").pixmap(16, 16))
         self.hardware_label = QLabel(f"Hardware: {self._hardware.info.name}")
         self.hardware_hint = QLabel(self._hardware.info.deployment_note)
         self.simulation_switch = QCheckBox("Modo Simulación")
         self.simulation_switch.setChecked(self._hardware.is_simulation())
         self.simulation_switch.setEnabled(False)
-        self.settings_button = QPushButton("Config .env")
+        self.simulation_switch.setIcon(_icon("cpu", size=16))
+        self.settings_button = QPushButton(" Config .env")
+        self.settings_button.setIcon(_icon("gear", size=16))
         self.dark_mode_switch = QCheckBox("Dark mode")
         self.dark_mode_switch.setChecked(True)
+        self.dark_mode_switch.setIcon(_icon("moon", size=16))
         header.addWidget(self.brand_logo)
+        header.addWidget(self.hardware_icon)
         header.addWidget(self.hardware_label)
         header.addStretch(1)
         header.addWidget(self.settings_button)
         header.addWidget(self.dark_mode_switch)
         header.addWidget(self.simulation_switch)
 
-        self.video_widget = OpenGLVideoWidget(self)
-        self.settings_panel = SettingsPanel()
-        self.cvat_panel = CvatPanel()
-        self.forge_panel = ForgePanel()
+        self.settings_panel = SettingsPanel(ui_profile=self._hardware.ui_profile)
+        self.forge_panel = ForgePanel(ui_profile=self._hardware.ui_profile)
         self.tabs = QTabWidget()
 
         live_tab = self._build_live_tab()
@@ -700,9 +906,9 @@ class MainWindow(QMainWindow):
         self.console.setFont(QFont("JetBrains Mono", 9))
         logs_layout.addWidget(self.console)
 
-        self.tabs.addTab(live_tab, "Live")
-        self.tabs.addTab(forge_tab, "Forge")
-        self.tabs.addTab(logs_tab, "Logs")
+        self.tabs.addTab(live_tab, _icon("camera-video", size=16), "Live")
+        self.tabs.addTab(forge_tab, _icon("box-seam", size=16), "Forge")
+        self.tabs.addTab(logs_tab, _icon("terminal", size=16), "Logs")
 
         root.addLayout(header)
         root.addWidget(self.hardware_hint)
@@ -712,14 +918,13 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar(self))
 
         self.settings_panel.env_changed.connect(self._apply_env_settings)
+        self.settings_panel.forge_test_requested.connect(self._test_forge_connection)
         self.settings_button.clicked.connect(self._open_settings_dialog)
         self.dark_mode_switch.toggled.connect(self._apply_dark_theme)
+        self.dark_mode_switch.toggled.connect(
+            lambda enabled: self.dark_mode_switch.setIcon(_icon("moon" if enabled else "sun", size=16))
+        )
         self.dark_mode_switch.toggled.connect(lambda enabled: self.settings_panel.ui_theme.setCurrentText("dark" if enabled else "light"))
-        self.cvat_panel.connect_button.clicked.connect(self._connect_cvat)
-        self.cvat_panel.refresh_button.clicked.connect(self._refresh_cvat_lists)
-        self.cvat_panel.capture_button.clicked.connect(self._capture_component_photo)
-        self.cvat_panel.upload_button.clicked.connect(self._upload_cvat_photos)
-        self.cvat_panel.export_button.clicked.connect(self._download_cvat_export)
         self.forge_panel.connect_button.clicked.connect(self._open_forge_config_dialog)
         self.forge_panel.refresh_button.clicked.connect(self._refresh_forge_lists)
         self.forge_panel.projects.currentItemChanged.connect(lambda *_: self._on_forge_project_selected())
@@ -730,36 +935,288 @@ class MainWindow(QMainWindow):
         self.forge_panel.create_camera_button.clicked.connect(self._create_forge_camera)
         self.forge_panel.create_line_button.clicked.connect(self._create_forge_line)
         self.forge_panel.assign_button.clicked.connect(self._assign_components_to_camera)
-        self.forge_panel.send_conf_button.clicked.connect(self._send_line_conf)
+        self.forge_panel.send_conf_requested.connect(lambda _line_id: self._send_line_conf())
         self.forge_panel.bulk_clear_requested.connect(self._on_bulk_clear_gpio)
+        self.forge_panel.help_requested.connect(self._open_shortcuts_dialog)
+        self.forge_panel.download_model_requested.connect(self._download_forge_project_model)
 
     def _build_live_tab(self) -> QWidget:
+        profile = self._hardware.ui_profile
+        video_box = self._build_video_box(profile)
+        side_box = self._build_side_box()
+
         live_tab = QWidget()
         outer = QVBoxLayout(live_tab)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(8)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setChildrenCollapsible(False)
+        splitter.setChildrenCollapsible(profile == "single")
+        splitter.addWidget(video_box)
+        splitter.addWidget(side_box)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 0)
+        if profile == "single":
+            splitter.setSizes([1400, 0])
+        else:
+            splitter.setSizes([900, 260])
+        self._live_splitter = splitter
 
+        outer.addWidget(splitter)
+
+        if profile == "single":
+            self._install_fullscreen_shortcut()
+            self._apply_lite_stylesheet()
+
+        return live_tab
+
+    def _build_video_box(self, profile: str) -> QWidget:
         video_box = QWidget()
         video_layout = QVBoxLayout(video_box)
         video_layout.setContentsMargins(0, 0, 0, 0)
         video_layout.setSpacing(6)
+
+        self._build_status_banners(video_layout)
+        self._video_layout = video_layout
+        self._video_profile = profile
+        self._video_view_widget = self._make_video_view_widget()
+        video_layout.addWidget(self._video_view_widget, 1)
+
+        return video_box
+
+    def _make_video_view_widget(self) -> QWidget:
+        use_grid = self._video_profile == "multi" or len(self._inference_workers) > 1
+        if use_grid:
+            return self._build_video_grid()
+        self.video_widget = OpenGLVideoWidget(self)
+        self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._tiles: list[OpenGLVideoWidget] = [self.video_widget]
+        return self.video_widget
+
+    def _rebuild_video_view(self) -> None:
+        if not hasattr(self, "_video_layout") or not hasattr(self, "_video_view_widget"):
+            return
+        old = self._video_view_widget
+        self._video_layout.removeWidget(old)
+        old.setParent(None)
+        old.deleteLater()
+        if hasattr(self, "_tile_health_timer"):
+            try:
+                self._tile_health_timer.stop()
+            except Exception:
+                pass
+        self._video_view_widget = self._make_video_view_widget()
+        self._video_layout.addWidget(self._video_view_widget, 1)
+
+    def _build_status_banners(self, video_layout: QVBoxLayout) -> None:
+        self.status_banner_icon = QLabel()
+        self.status_banner_icon.setFixedSize(16, 16)
+        self.status_banner_icon.setPixmap(_icon("info-circle", size=16, color="info").pixmap(16, 16))
+        status_row = QWidget()
+        status_row_layout = QHBoxLayout(status_row)
+        status_row_layout.setContentsMargins(0, 0, 0, 0)
+        status_row_layout.setSpacing(8)
         self.status_banner = QLabel("Ready")
         self.status_banner.setStyleSheet(
             "padding: 6px 10px; border-radius: 6px; background: #1b2028; color: #d8dde3;"
         )
-        video_layout.addWidget(self.status_banner)
+        status_row_layout.addWidget(self.status_banner_icon)
+        status_row_layout.addWidget(self.status_banner, 1)
+        video_layout.addWidget(status_row)
+
+        self.stream_banner_icon = QLabel()
+        self.stream_banner_icon.setFixedSize(16, 16)
+        self.stream_banner_icon.setPixmap(_icon("camera-video", size=16, color="muted").pixmap(16, 16))
+        stream_row = QWidget()
+        stream_row_layout = QHBoxLayout(stream_row)
+        stream_row_layout.setContentsMargins(0, 0, 0, 0)
+        stream_row_layout.setSpacing(8)
         self.stream_banner = QLabel("Fuente de video pendiente...")
         self.stream_banner.setWordWrap(True)
         self.stream_banner.setStyleSheet(
             "padding: 6px 10px; border-radius: 6px; background: #141820; color: #cfd6e1;"
         )
-        video_layout.addWidget(self.stream_banner)
-        video_layout.addWidget(self.video_widget, 1)
-        self.video_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        stream_row_layout.addWidget(self.stream_banner_icon)
+        stream_row_layout.addWidget(self.stream_banner, 1)
+        video_layout.addWidget(stream_row)
 
+        self.pool_banner_icon = QLabel()
+        self.pool_banner_icon.setFixedSize(16, 16)
+        self.pool_banner_icon.setPixmap(_icon("diagram-3", size=16, color="muted").pixmap(16, 16))
+        pool_row = QWidget()
+        pool_row_layout = QHBoxLayout(pool_row)
+        pool_row_layout.setContentsMargins(0, 0, 0, 0)
+        pool_row_layout.setSpacing(8)
+        self.pool_banner = QLabel("")
+        self.pool_banner.setWordWrap(True)
+        self.pool_banner.setStyleSheet(
+            "padding: 4px 10px; border-radius: 6px; background: #141820; color: #9aa6b2; font-size: 11px;"
+        )
+        self.pool_banner.setVisible(False)
+        pool_row_layout.addWidget(self.pool_banner_icon)
+        pool_row_layout.addWidget(self.pool_banner, 1)
+        self.pool_row = pool_row
+        self.pool_row.setVisible(False)
+        video_layout.addWidget(pool_row)
+
+    def _build_video_grid(self) -> QWidget:
+        n = max(1, len(self._inference_workers))
+
+        grid_widget = QWidget()
+        grid = QGridLayout(grid_widget)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(6)
+
+        self._tile_grid_layout = grid
+        self._tile_widgets: list[QWidget] = []
+        self._tiles: list[OpenGLVideoWidget] = []
+        self._tile_badges: list[QLabel] = []
+        self._tile_camera_ids: list[str] = []
+        self._tile_frame_history: list[list[float]] = []
+        self._tile_last_frame: list[float] = []
+        self._spotlight_index: int | None = None
+        for index in range(n):
+            cam_id = self._inference_workers[index].camera_id
+            tile, video, badge = self._build_tile(cam_id)
+            tile.installEventFilter(self)
+            self._tile_widgets.append(tile)
+            self._tiles.append(video)
+            self._tile_badges.append(badge)
+            self._tile_camera_ids.append(cam_id)
+            self._tile_frame_history.append([])
+            self._tile_last_frame.append(0.0)
+
+        self._apply_spotlight_layout()
+        self.video_widget = self._tiles[0]
+        self._tile_health_timer = QTimer(self)
+        self._tile_health_timer.setInterval(500)
+        self._tile_health_timer.timeout.connect(self._refresh_tile_health)
+        self._tile_health_timer.start()
+        return grid_widget
+
+    def _apply_spotlight_layout(self) -> None:
+        grid = self._tile_grid_layout
+        while grid.count():
+            grid.takeAt(0)
+        n = len(self._tile_widgets)
+        if self._spotlight_index is None or n <= 1:
+            rows, cols = self._tile_grid_dims(n)
+            for r in range(rows):
+                grid.setRowStretch(r, 1)
+            for c in range(cols):
+                grid.setColumnStretch(c, 1)
+            for index, tile in enumerate(self._tile_widgets):
+                r, c = divmod(index, cols)
+                grid.addWidget(tile, r, c)
+            return
+        spot = max(0, min(self._spotlight_index, n - 1))
+        others = n - 1
+        spot_cols = 4
+        grid.addWidget(self._tile_widgets[spot], 0, 0, max(1, others), spot_cols)
+        side = 0
+        for idx, tile in enumerate(self._tile_widgets):
+            if idx == spot:
+                continue
+            grid.addWidget(tile, side, spot_cols, 1, 1)
+            side += 1
+        for r in range(max(1, others)):
+            grid.setRowStretch(r, 1)
+        for c in range(spot_cols):
+            grid.setColumnStretch(c, 4)
+        grid.setColumnStretch(spot_cols, 1)
+
+    def _toggle_spotlight(self, index: int) -> None:
+        if not hasattr(self, "_tile_widgets") or len(self._tile_widgets) <= 1:
+            return
+        self._spotlight_index = None if self._spotlight_index == index else index
+        self._apply_spotlight_layout()
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if hasattr(self, "_tile_widgets") and obj in self._tile_widgets:
+            if event.type() == QEvent.Type.MouseButtonDblClick:
+                self._spotlight_index = None
+                self._apply_spotlight_layout()
+                return True
+            if event.type() == QEvent.Type.MouseButtonPress:
+                self._toggle_spotlight(self._tile_widgets.index(obj))
+                return True
+        return super().eventFilter(obj, event)
+
+    @staticmethod
+    def _tile_grid_dims(n: int) -> tuple[int, int]:
+        if n <= 1:
+            return (1, 1)
+        if n == 2:
+            return (1, 2)
+        if n <= 4:
+            return (2, 2)
+        if n <= 6:
+            return (2, 3)
+        if n <= 9:
+            return (3, 3)
+        cols = 4
+        rows = (n + cols - 1) // cols
+        return (rows, cols)
+
+    def _build_tile(self, camera_id: str) -> tuple[QWidget, OpenGLVideoWidget, QLabel]:
+        tile = QFrame()
+        tile.setFrameShape(QFrame.Shape.StyledPanel)
+        tile.setStyleSheet("QFrame { background:#0d1014; border:1px solid #2a313a; border-radius:6px; }")
+        layout = QVBoxLayout(tile)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+
+        video = OpenGLVideoWidget(tile)
+        video.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        video.setMinimumHeight(180)
+        layout.addWidget(video, 1)
+
+        badge = QLabel(camera_id)
+        badge.setStyleSheet(self._TILE_BADGE_QSS_ONLINE)
+        badge.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(badge, 0)
+        return tile, video, badge
+
+    _TILE_BADGE_QSS_ONLINE = (
+        "padding: 2px 6px; background: rgba(0,0,0,0.55); color: #e6eaf2;"
+        " font-size: 10px; border-radius: 4px;"
+    )
+    _TILE_BADGE_QSS_OFFLINE = (
+        "padding: 2px 6px; background: rgba(58, 31, 36, 0.85); color: #e9a4a4;"
+        " font-size: 10px; border-radius: 4px;"
+    )
+
+    def _on_tile_frame(self, index: int) -> None:
+        if not hasattr(self, "_tile_frame_history") or index >= len(self._tile_frame_history):
+            return
+        now = time.monotonic()
+        history = self._tile_frame_history[index]
+        history.append(now)
+        if len(history) > 30:
+            del history[0 : len(history) - 30]
+        self._tile_last_frame[index] = now
+
+    def _refresh_tile_health(self) -> None:
+        if not hasattr(self, "_tile_badges"):
+            return
+        now = time.monotonic()
+        for i, badge in enumerate(self._tile_badges):
+            history = self._tile_frame_history[i]
+            if len(history) >= 2:
+                fps = (len(history) - 1) / max(0.001, history[-1] - history[0])
+            else:
+                fps = 0.0
+            offline = (now - self._tile_last_frame[i]) > 2.0 if self._tile_last_frame[i] > 0 else True
+            cam_id = self._tile_camera_ids[i]
+            if offline:
+                badge.setText(f"●  {cam_id}  ·  offline")
+                badge.setStyleSheet(self._TILE_BADGE_QSS_OFFLINE)
+            else:
+                badge.setText(f"{cam_id}  ·  {fps:.1f} FPS")
+                badge.setStyleSheet(self._TILE_BADGE_QSS_ONLINE)
+
+    def _build_side_box(self) -> QWidget:
         side_box = QFrame()
         side_box.setFrameShape(QFrame.Shape.StyledPanel)
         side_box.setStyleSheet("QFrame { background:#11141a; border:1px solid #2a313a; border-radius:8px; }")
@@ -782,24 +1239,47 @@ class MainWindow(QMainWindow):
         self.temperature = QLabel("0 °C")
         for value_label in (self.fps_capture, self.fps_inference, self.latency, self.ram, self.vram, self.temperature):
             value_label.setStyleSheet("font-weight:600; color:#e6eaf2;")
+        self.fps_capture_spark = Sparkline(color="#62d2a2")
+        self.fps_inference_spark = Sparkline(color="#5aa9e6")
+        self.latency_spark = Sparkline(color="#f4b942")
+        for spark in (self.fps_capture_spark, self.fps_inference_spark, self.latency_spark):
+            spark.setFixedHeight(18)
         rows = [
-            ("FPS captura", self.fps_capture),
-            ("FPS inferencia", self.fps_inference),
-            ("Latencia", self.latency),
-            ("RAM", self.ram),
-            ("VRAM", self.vram),
-            ("SoC", self.temperature),
+            ("camera-video", "FPS captura", self.fps_capture, self.fps_capture_spark),
+            ("activity", "FPS inferencia", self.fps_inference, self.fps_inference_spark),
+            ("stopwatch", "Latencia", self.latency, self.latency_spark),
+            ("memory", "RAM", self.ram, None),
+            ("cpu", "VRAM", self.vram, None),
+            ("thermometer-half", "SoC", self.temperature, None),
         ]
-        for row, (label_text, value_widget) in enumerate(rows):
+        for row, (icon_name, label_text, value_widget, spark) in enumerate(rows):
+            icon_label = QLabel()
+            icon_label.setPixmap(_icon(icon_name, size=14, color="muted").pixmap(14, 14))
+            icon_label.setFixedSize(16, 16)
             key = QLabel(label_text)
             key.setStyleSheet("color:#8b95a1;")
-            telemetry_grid.addWidget(key, row, 0)
-            telemetry_grid.addWidget(value_widget, row, 1)
+            telemetry_grid.addWidget(icon_label, row, 0)
+            telemetry_grid.addWidget(key, row, 1)
+            telemetry_grid.addWidget(value_widget, row, 2)
+            if spark is not None:
+                telemetry_grid.addWidget(spark, row, 3)
+        telemetry_grid.setColumnMinimumWidth(3, 70)
+        telemetry_grid.setColumnStretch(3, 1)
         side_layout.addLayout(telemetry_grid)
 
+        health_row = QWidget()
+        health_row_layout = QHBoxLayout(health_row)
+        health_row_layout.setContentsMargins(0, 6, 0, 0)
+        health_row_layout.setSpacing(6)
+        health_icon = QLabel()
+        health_icon.setFixedSize(16, 16)
+        health_icon.setPixmap(_icon("heart-pulse", size=16, color="info").pixmap(16, 16))
         health_label = QLabel("Health")
-        health_label.setStyleSheet("color:#8b95a1; margin-top:6px;")
-        side_layout.addWidget(health_label)
+        health_label.setStyleSheet("color:#8b95a1;")
+        health_row_layout.addWidget(health_icon)
+        health_row_layout.addWidget(health_label)
+        health_row_layout.addStretch(1)
+        side_layout.addWidget(health_row)
         self.health_bar = QProgressBar()
         self.health_bar.setRange(0, 100)
         self.health_bar.setValue(100)
@@ -813,27 +1293,40 @@ class MainWindow(QMainWindow):
 
         side_layout.addStretch(1)
 
-        self.capture_button = QPushButton("Tomar foto")
+        self.capture_button = QPushButton(" Tomar foto")
+        self.capture_button.setIcon(_icon("camera", size=16))
         self.capture_button.clicked.connect(self._capture_component_photo)
-        self.restart_button = QPushButton("Reiniciar inferencia")
+        self.restart_button = QPushButton(" Reiniciar inferencia")
+        self.restart_button.setIcon(_icon("arrow-repeat", size=16))
         self.restart_button.clicked.connect(self._restart_inference)
         side_layout.addWidget(self.capture_button)
         side_layout.addWidget(self.restart_button)
 
         side_box.setMinimumWidth(220)
         side_box.setMaximumWidth(320)
+        return side_box
 
-        splitter.addWidget(video_box)
-        splitter.addWidget(side_box)
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 0)
-        splitter.setSizes([900, 260])
-        self._live_splitter = splitter
+    def _install_fullscreen_shortcut(self) -> None:
+        shortcut = QShortcut(QKeySequence("F11"), self)
+        shortcut.activated.connect(self._toggle_fullscreen)
 
-        outer.addWidget(splitter)
-        return live_tab
+    def _toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def _apply_lite_stylesheet(self) -> None:
+        # Pi has the slow VC4 GPU — drop borders/radii on heavy frames.
+        self.setStyleSheet(
+            (self.styleSheet() or "")
+            + " QFrame { border-radius: 4px; } QPushButton { padding: 6px 10px; }"
+        )
 
     def _apply_env_settings(self, values: dict) -> None:
+        self._settings = Settings.from_mapping(values)
+        self._model_path = self._resolve_model_path(self._settings.model_path)
+        self._output_dispatcher.update_config(InferenceOutputConfig.from_mapping(values))
         forge_url = values.get("FORGE_URL") or self.forge_panel.base_url.text().strip()
         self._forge = ForgeManager(forge_url or "https://forge.iinia.ai/api/swagger/")
         if token := values.get("FORGE_TOKEN"):
@@ -844,31 +1337,66 @@ class MainWindow(QMainWindow):
         self.forge_panel.username.setText(values.get("FORGE_USERNAME", ""))
         self.forge_panel.password.setText(values.get("FORGE_PASSWORD", ""))
         self.forge_panel.token.setText(values.get("FORGE_TOKEN", ""))
-        cvat_url = values.get("CVAT_URL") or self.cvat_panel.base_url.text().strip()
-        self._cvat = CvatManager(cvat_url or "https://app.cvat.ai")
-        if token := values.get("CVAT_TOKEN"):
-            self._cvat.set_token(token)
-        elif values.get("CVAT_USERNAME") and values.get("CVAT_PASSWORD"):
-            self._cvat.set_basic_auth(values.get("CVAT_USERNAME", ""), values.get("CVAT_PASSWORD", ""))
-        self.cvat_panel.set_values(
-            base_url=cvat_url,
-            username=values.get("CVAT_USERNAME"),
-            password=values.get("CVAT_PASSWORD"),
-            token=values.get("CVAT_TOKEN"),
-        )
-        self.cvat_panel.set_status("Configuración cargada desde .env")
         self.forge_panel.set_status("Configuración Forge cargada desde .env")
         theme = str(values.get("UI_THEME", "dark")).strip().lower()
         self.dark_mode_switch.setChecked(theme != "light")
+        for worker in self._inference_workers:
+            worker.set_model_path(self._model_path)
+        if self._model_path is not None:
+            self._append_log(f"Model path selected: {self._model_path}")
+        protocols = self._settings.output_config.enabled_protocols()
+        if protocols:
+            self._append_log("Inference outputs enabled: " + ", ".join(protocols))
+        model_url = str(values.get("FORGE_MODEL_URL", "")).strip()
+        model_asset_uuid = str(values.get("FORGE_MODEL_ASSET_UUID", "")).strip()
+        self.forge_panel.set_model_download_available(bool(model_url or model_asset_uuid))
+        if model_url and self._model_path is None:
+            self._download_model_url(model_url)
+        if model_asset_uuid and self._model_path is None:
+            self._download_model_asset(model_asset_uuid)
         self._set_status("Configuration loaded from .env")
         self._append_log("Configuration loaded from .env")
         self._apply_dark_theme(self.dark_mode_switch.isChecked())
 
+    def _test_forge_connection(self, values: dict) -> None:
+        url = (values.get("FORGE_URL") or "").strip() or "https://forge.iinia.ai/api/swagger/"
+        forge = ForgeManager(url, retry_attempts=1)
+        token = values.get("FORGE_TOKEN", "").strip()
+        user = values.get("FORGE_USERNAME", "").strip()
+        password = values.get("FORGE_PASSWORD", "")
+        if token:
+            forge.set_token(token)
+        elif user and password:
+            forge.set_basic_auth(user, password)
+
+        def _ping() -> object:
+            forge.ping()
+            return {"ok": True}
+
+        def _ok(_payload: object) -> None:
+            self.settings_panel.set_forge_test_result(True, url)
+            if hasattr(self, "_toast"):
+                self._toast.show("Conexión Forge OK", severity="success", ttl_ms=3000)
+
+        def _err(detail: str) -> None:
+            self.settings_panel.set_forge_test_result(False, detail or "Sin detalle")
+            if hasattr(self, "_toast"):
+                self._toast.show(f"Forge: {detail or 'error'}", severity="error", ttl_ms=4000)
+
+        self._run_async(_ping, on_ok=_ok, on_error=_err, busy_text="Probando Forge…")
+
     def _open_settings_dialog(self) -> None:
-        dialog = SettingsDialog(env_path=self.settings_panel.env_file.text().strip() or ".env", parent=self)
+        dialog = SettingsDialog(
+            env_path=self.settings_panel.env_file.text().strip() or ".env",
+            parent=self,
+            ui_profile=self._hardware.ui_profile,
+        )
         dialog.panel.env_changed.connect(self._apply_env_settings)
         dialog.panel.video_source_changed.connect(self._apply_video_source_config)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        dialog.panel.forge_test_requested.connect(self._test_forge_connection)
+        result = dialog.exec()
+        dialog.deleteLater()
+        if result == QDialog.DialogCode.Accepted:
             self.settings_panel.load_env()
 
     def _apply_video_source_config(self, payload: dict) -> None:
@@ -879,6 +1407,7 @@ class MainWindow(QMainWindow):
         save_inference_source_config(VIDEO_SOURCE_PATH, self._video_source_config)
         self._set_status("Reiniciando fuente de video...")
         self._append_log("Video source configuration saved.")
+        self._restart_count = 0
         QTimer.singleShot(0, self._restart_inference)
 
     def _on_source_ready(self, payload: dict) -> None:
@@ -995,53 +1524,95 @@ class MainWindow(QMainWindow):
         return list(dict.fromkeys(normalized))
 
     def _load_gpio_assignments(self) -> dict[str, dict[str, str]]:
-        path = Path("configs/forge_gpio_assignments.json")
-        if not path.exists():
-            return {}
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(payload, dict):
-                assignments: dict[str, dict[str, str]] = {}
-                dirty = False
-                for project_id, value in payload.items():
-                    if not isinstance(value, dict):
-                        dirty = True
-                        continue
-                    cleaned: dict[str, str] = {}
-                    for raw_label, raw_port in value.items():
-                        label = self._normalize_label_name(raw_label)
-                        port = str(raw_port).strip()
-                        if not label or not port:
-                            dirty = True
-                            continue
-                        cleaned[label] = port
-                    raw_labels = [str(label).strip() for label in value.keys() if str(label).strip()]
-                    if list(cleaned.keys()) != raw_labels:
-                        dirty = True
-                    if cleaned:
-                        assignments[str(project_id)] = cleaned
-                if dirty:
-                    try:
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_text(json.dumps(assignments, indent=2, ensure_ascii=False), encoding="utf-8")
-                    except Exception:
-                        pass
-                return assignments
-        except Exception:
-            return {}
-        return {}
+        raw = load_gpio_assignments()
+        assignments: dict[str, dict[str, str]] = {}
+        dirty = False
+        for project_id, mapping in raw.items():
+            cleaned: dict[str, str] = {}
+            for raw_label, raw_port in mapping.items():
+                label = self._normalize_label_name(raw_label)
+                port = str(raw_port).strip()
+                if not label or not port:
+                    dirty = True
+                    continue
+                cleaned[label] = port
+            if list(cleaned.keys()) != list(mapping.keys()):
+                dirty = True
+            if cleaned:
+                assignments[str(project_id)] = cleaned
+        if dirty:
+            try:
+                save_gpio_assignments(assignments)
+            except OSError:
+                pass
+        return assignments
 
     def _save_gpio_assignments(self) -> None:
-        path = Path("configs/forge_gpio_assignments.json")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self._gpio_assignments, indent=2, ensure_ascii=False), encoding="utf-8")
+        save_gpio_assignments(self._gpio_assignments)
 
     def _bootstrap_from_env(self) -> None:
         if self.forge_panel.username.text().strip() or self.forge_panel.token.text().strip():
             self._refresh_forge_lists()
+        self._verify_credentials_async()
+
+    def _verify_credentials_async(self) -> None:
+        if self.forge_panel.username.text().strip() or self.forge_panel.token.text().strip():
+            self._run_async(
+                self._forge.ping,
+                on_ok=lambda _: self._append_log(f"Forge ping OK ({self._forge.base_url})"),
+                on_error=lambda err: self._append_log(f"Forge ping failed: {err}"),
+                busy_text="Verifying Forge credentials...",
+            )
 
     def _set_status(self, text: str) -> None:
         self.status_banner.setText(text)
+        if not hasattr(self, "status_banner_icon"):
+            return
+        lower = text.lower()
+        if any(token in lower for token in ("error", "fail", "frozen", "abort")):
+            icon_name, icon_color = "x-circle", "danger"
+        elif any(token in lower for token in ("ok", "ready", "loaded", "activo", "guardado")):
+            icon_name, icon_color = "check-circle", "accent"
+        else:
+            icon_name, icon_color = "info-circle", "info"
+        self.status_banner_icon.setPixmap(_icon(icon_name, size=16, color=icon_color).pixmap(16, 16))
+
+    def _handle_worker_frozen(self, camera_id: str) -> None:
+        frozen = getattr(self, "_frozen_cameras", set())
+        frozen = set(frozen)
+        frozen.add(camera_id)
+        self._frozen_cameras = frozen
+        self._report_error(
+            f"Inference frozen ({camera_id})",
+            RuntimeError("watchdog will restart worker"),
+        )
+        self._refresh_pool_banner()
+
+    def _refresh_pool_banner(self) -> None:
+        if not hasattr(self, "pool_banner"):
+            return
+        workers = self._inference_workers
+        if len(workers) <= 1:
+            if hasattr(self, "pool_row"):
+                self.pool_row.setVisible(False)
+            return
+        frozen = getattr(self, "_frozen_cameras", set())
+        if hasattr(self, "pool_row"):
+            self.pool_row.setVisible(True)
+        if hasattr(self, "pool_banner_icon"):
+            if frozen:
+                self.pool_banner_icon.setPixmap(_icon("exclamation-triangle", size=16, color="warning").pixmap(16, 16))
+            else:
+                self.pool_banner_icon.setPixmap(_icon("diagram-3", size=16, color="info").pixmap(16, 16))
+        parts: list[str] = []
+        for worker in workers:
+            cam_id = worker.camera_id
+            mark = "⚠" if cam_id in frozen else "●"
+            parts.append(f"{mark} {cam_id}")
+        active = sum(1 for w in workers if w.camera_id not in frozen)
+        summary = f"Cámaras activas: {active}/{len(workers)}  ·  " + "  ".join(parts)
+        self.pool_banner.setText(summary)
+        self.pool_banner.setVisible(True)
 
     def _refresh_live_summary(self) -> None:
         if not hasattr(self, "stream_banner"):
@@ -1058,6 +1629,14 @@ class MainWindow(QMainWindow):
         provider = str(telemetry.get("provider_name", self._hardware.info.name)).strip()
         text = f"{state} · {kind} · {label} · {fps:.1f} FPS · {latency:.0f} ms · {provider}"
         self.stream_banner.setText(text)
+        if hasattr(self, "stream_banner_icon"):
+            if active:
+                icon_name, icon_color = ("broadcast", "info") if kind == "RTSP" else ("camera-video", "accent")
+            elif source.get("source"):
+                icon_name, icon_color = "exclamation-triangle", "warning"
+            else:
+                icon_name, icon_color = "slash-circle", "danger"
+            self.stream_banner_icon.setPixmap(_icon(icon_name, size=16, color=icon_color).pixmap(16, 16))
         self.video_widget.set_status(text)
 
         if active:
@@ -1146,105 +1725,6 @@ class MainWindow(QMainWindow):
 
         self._safe_ui_call(_capture, context="Capture photo error")
 
-    def _selected_task_id(self) -> int | None:
-        raw = self.cvat_panel.task_id.text().strip()
-        return int(raw) if raw.isdigit() else None
-
-    def _selected_project_id(self) -> int | None:
-        raw = self.cvat_panel.project_id.text().strip()
-        return int(raw) if raw.isdigit() else None
-
-    def _connect_cvat(self) -> None:
-        base_url = self.cvat_panel.base_url.text().strip()
-        token = self.cvat_panel.token.text().strip()
-        username = self.cvat_panel.username.text().strip()
-        password = self.cvat_panel.password.text().strip()
-        self._run_async(
-            lambda: self._connect_cvat_sync(base_url, token, username, password),
-            on_ok=self._on_cvat_connected,
-            on_error=lambda err: self._report_error("CVAT connect error", RuntimeError(err)),
-            busy_text="Connecting to CVAT...",
-        )
-
-    def _connect_cvat_sync(self, base_url: str, token: str, username: str, password: str) -> str:
-        self._cvat = CvatManager(base_url or "https://app.cvat.ai")
-        if token:
-            self._cvat.set_token(token)
-            return "token"
-        if username and password:
-            self._cvat.login(username, password)
-            return "login"
-        return "url"
-
-    def _on_cvat_connected(self, mode: object) -> None:
-        status = {
-            "token": "CVAT token configured",
-            "login": "CVAT authenticated",
-            "url": "CVAT URL configured",
-        }.get(str(mode), "CVAT ready")
-        self.cvat_panel.set_status(status)
-        self._set_status(status)
-        self._append_log(status)
-
-    def _refresh_cvat_lists(self) -> None:
-        task_id = self._selected_task_id()
-        self._run_async(
-            lambda: {
-                "projects": self._cvat.list_projects(),
-                "jobs": self._cvat.list_jobs(task_id=task_id),
-            },
-            on_ok=self._populate_cvat_lists,
-            on_error=lambda err: self._report_error("CVAT refresh error", RuntimeError(err)),
-            busy_text="Refreshing CVAT lists...",
-        )
-
-    def _populate_cvat_lists(self, payload: object) -> None:
-        if not isinstance(payload, dict):
-            return
-        self.cvat_panel.projects.clear()
-        self.cvat_panel.jobs.clear()
-        for project in payload.get("projects", []):
-            self.cvat_panel.projects.addItem(f"{project.id}: {project.name}")
-        for job in payload.get("jobs", []):
-            self.cvat_panel.jobs.addItem(f"{job.id}: {job.name} (task {job.task_id})")
-        self.cvat_panel.set_status("Projects and jobs refreshed")
-        self._set_status("CVAT data refreshed")
-        self._append_log("CVAT projects and jobs refreshed.")
-
-    def _upload_cvat_photos(self) -> None:
-        task_id = self._selected_task_id()
-        if task_id is None:
-            self._append_log("Set a valid Task ID before uploading photos.")
-            return
-        capture_root = Path(self.settings_panel.capture_dir.text().strip() or "captures")
-        image_paths = sorted(capture_root.glob("*.png"))[-10:]
-        if not image_paths:
-            self._append_log("No component photos found to upload.")
-            return
-        self._run_async(
-            lambda: self._cvat.upload_images_to_task(task_id, image_paths),
-            on_ok=lambda _: self._append_log(f"Uploaded {len(image_paths)} photos to CVAT task {task_id}."),
-            on_error=lambda err: self._report_error("CVAT upload error", RuntimeError(err)),
-            busy_text=f"Uploading {len(image_paths)} photos...",
-        )
-
-    def _download_cvat_export(self) -> None:
-        export_format = self.cvat_panel.export_format.currentText()
-        out_dir = Path(self.settings_panel.model_dir.text().strip() or "models") / "cvat"
-        project_id = self._selected_project_id()
-        task_id = self._selected_task_id()
-        self._run_async(
-            lambda: self._cvat.download_export_to_dir(
-                project_id=project_id,
-                task_id=None if project_id is not None else task_id,
-                export_format=export_format,
-                out_dir=out_dir,
-            ),
-            on_ok=lambda path: self._append_log(f"CVAT export downloaded: {path}"),
-            on_error=lambda err: self._report_error("CVAT export error", RuntimeError(err)),
-            busy_text="Downloading CVAT export...",
-        )
-
     def _connect_forge(self) -> None:
         base_url = self.forge_panel.base_url.text().strip()
         username = self.forge_panel.username.text().strip()
@@ -1291,6 +1771,91 @@ class MainWindow(QMainWindow):
         self._set_status("Forge ready")
         self._append_log("Forge connection ready.")
 
+    def _download_model_url(self, url: str) -> None:
+        if not self._begin_model_download():
+            return
+        target_dir = self._model_target_dir()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        parsed = urllib.parse.urlparse(url)
+        name = Path(parsed.path).name or "forge_model.pt"
+        if not name.endswith(".pt"):
+            name = f"{name}.pt"
+        target = target_dir / name
+
+        def download() -> Path:
+            data = self._forge._request("GET", url, binary=True)
+            target.write_bytes(bytes(data))
+            return target
+
+        self._run_async(
+            download,
+            on_ok=self._finish_model_download,
+            on_error=lambda err: self._fail_model_download("Forge model URL download failed", err),
+            busy_text="Downloading model .pt from Forge URL...",
+        )
+
+    def _download_forge_project_model(self, project_id: int) -> None:
+        model_url = self.settings_panel.forge_model_url.text().strip()
+        if model_url:
+            self._download_model_url(model_url)
+            return
+        model_asset_uuid = self.settings_panel.forge_model_asset_uuid.text().strip()
+        if model_asset_uuid:
+            self._download_model_asset(model_asset_uuid)
+            return
+        if project_id < 0:
+            self._append_log("Select a Forge project first.")
+            return
+        if not self._begin_model_download():
+            return
+        target_dir = self._model_target_dir()
+        self._run_async(
+            lambda: self._forge.download_project_model(project_id, target_dir),
+            on_ok=self._finish_model_download,
+            on_error=lambda err: self._fail_model_download("Forge project model download failed", err),
+            busy_text=f"Downloading project {project_id} model .pt...",
+        )
+
+    def _download_model_asset(self, asset_uuid: str) -> None:
+        if not self._begin_model_download():
+            return
+        target_dir = self._model_target_dir()
+        self._run_async(
+            lambda: self._forge.download_asset(asset_uuid, target_dir),
+            on_ok=self._finish_model_download,
+            on_error=lambda err: self._fail_model_download("Forge model asset download failed", err),
+            busy_text="Downloading model .pt from Forge asset...",
+        )
+
+    def _model_target_dir(self) -> Path:
+        path = Path(self.settings_panel.model_dir.text().strip() or "models")
+        return path.parent if path.suffix == ".pt" else path
+
+    def _begin_model_download(self) -> bool:
+        if self._model_download_inflight:
+            self._append_log("Model download already in progress; ignoring duplicate request.")
+            return False
+        self._model_download_inflight = True
+        return True
+
+    def _finish_model_download(self, path: object) -> None:
+        self._model_download_inflight = False
+        self._use_downloaded_model(path)
+
+    def _fail_model_download(self, context: str, message: str) -> None:
+        self._model_download_inflight = False
+        self._report_error(context, RuntimeError(message))
+
+    def _use_downloaded_model(self, path: object) -> None:
+        model_path = Path(path)
+        self._model_path = model_path
+        self.settings_panel.model_dir.setText(str(model_path))
+        for worker in self._inference_workers:
+            worker.set_model_path(model_path)
+        self._append_log(f"Forge model downloaded: {model_path}")
+        self._set_status(f"Model downloaded: {model_path.name}")
+        QTimer.singleShot(0, self._restart_inference)
+
     def _refresh_forge_lists(self) -> None:
         self._run_async(
             lambda: {
@@ -1317,8 +1882,13 @@ class MainWindow(QMainWindow):
         self.forge_panel.set_status("Forge lists refreshed")
         self._set_status("Forge data refreshed")
         if self.forge_panel.projects.count() and self.forge_panel.projects.currentRow() < 0:
-            self.forge_panel.projects.setCurrentRow(0)
+            last_project = get_last_project_id()
+            if last_project is None or not self.forge_panel.select_project_by_id(last_project):
+                self.forge_panel.projects.setCurrentRow(0)
         self._on_forge_project_selected()
+        last_camera = get_last_camera_id()
+        if last_camera is not None:
+            self.forge_panel.select_camera_by_id(last_camera)
         self._sync_selected_camera_assignments()
 
     def _refresh_label_assignment_index(self) -> None:
@@ -1371,12 +1941,23 @@ class MainWindow(QMainWindow):
     def _on_forge_project_selected(self) -> None:
         self._refresh_forge_project_details()
         self._sync_selected_camera_assignments()
+        try:
+            set_last_project_id(self.forge_panel.selected_project_id())
+        except OSError as exc:
+            log.warning("Could not persist last project: %s", exc)
 
     def _sync_selected_camera_assignments(self) -> None:
         assignments = self._current_camera_assignments()
         self.forge_panel.set_assigned(assignments)
         self.forge_panel.set_gpio_assignments(self._current_gpio_assignments())
         self._gpio_worker.set_assignments(self._current_gpio_assignments())
+        item = self.forge_panel.cameras.currentItem()
+        if item is not None:
+            cam_id = item.data(Qt.ItemDataRole.UserRole)
+            try:
+                set_last_camera_id(int(cam_id) if cam_id is not None else None)
+            except (OSError, TypeError, ValueError) as exc:
+                log.warning("Could not persist last camera: %s", exc)
 
     def _on_bulk_clear_gpio(self, labels: list[str]) -> None:
         project_id = self.forge_panel.selected_project_id()
@@ -1400,11 +1981,13 @@ class MainWindow(QMainWindow):
         self.forge_panel.set_gpio_assignments(current)
         self._gpio_worker.set_assignments(current)
         self._append_log(f"Cleared GPIO assignment for {len(removed)} labels.")
+        self._toast.show(f"{len(removed)} GPIO desvinculadas", severity="warn")
+        self._push_assignment_history(f"Bulk clear {len(removed)}")
 
     def _on_gpio_labels_dropped(self, port: str, labels: list[str]) -> None:
         project_id = self.forge_panel.selected_project_id()
         if project_id is None:
-            self._append_log("Select a project first.")
+            self._toast.show("Selecciona un proyecto primero", severity="warn")
             return
         cleaned_labels = [label for label in (self._normalize_label_name(raw) for raw in labels) if label]
         if not cleaned_labels:
@@ -1418,6 +2001,17 @@ class MainWindow(QMainWindow):
         self.forge_panel.set_gpio_assignments(current)
         self._gpio_worker.set_assignments(current)
         self._append_log(f"Assigned {len(cleaned_labels)} labels to {port}.")
+        n = len(cleaned_labels)
+        preview = ", ".join(cleaned_labels[:3]) + ("…" if n > 3 else "")
+        self._toast.show(f"{n} label{'s' if n != 1 else ''} → {port}  ({preview})", severity="success")
+        self._push_assignment_history(f"Drop {n} → {port}")
+
+    def _camera_display_name(self, camera_id: int) -> str:
+        for i in range(self.forge_panel.cameras.count()):
+            item = self.forge_panel.cameras.item(i)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == camera_id:
+                return item.text()
+        return f"cam {camera_id}"
 
     def _on_camera_labels_dropped(self, camera_id: int, labels: list[str]) -> None:
         key = str(camera_id)
@@ -1432,6 +2026,10 @@ class MainWindow(QMainWindow):
         self._save_local_assignments()
         self._refresh_label_assignment_index()
         self._append_log(f"Camera {camera_id}: assigned {len(cleaned_labels)} labels via drag & drop.")
+        cam_name = self._camera_display_name(camera_id)
+        n = len(cleaned_labels)
+        self._toast.show(f"{n} label{'s' if n != 1 else ''} → {cam_name}", severity="success")
+        self._push_assignment_history(f"Drop {n} → {cam_name}")
         self._run_async(
             lambda: self._forge.update_camera(camera_id, {"labels": current, "assigned_components": current, "components": current}),
             on_ok=lambda _: (self._append_log(f"Camera {camera_id} updated from drag & drop."), self._refresh_forge_lists()),
@@ -1471,7 +2069,8 @@ class MainWindow(QMainWindow):
         preview = payload.get("preview", {})
         self.forge_panel.set_labels(labels if isinstance(labels, list) else [])
         self._known_labels = [item for item in labels if isinstance(item, dict)] if isinstance(labels, list) else []
-        self._inference_worker.set_known_labels(self._known_labels)
+        for worker in self._inference_workers:
+            worker.set_known_labels(self._known_labels)
         if self.forge_panel.labels.count() and self.forge_panel.labels.currentRow() < 0:
             self.forge_panel.labels.setCurrentRow(0)
         label_display: list[str] = []
@@ -1606,96 +2205,260 @@ class MainWindow(QMainWindow):
             busy_text=f"Sending configuration to line {line_id}...",
         )
 
+    def _unwire_threads(self) -> None:
+        for worker in getattr(self, "_inference_workers", []):
+            for signal in (
+                worker.frame_ready,
+                worker.source_ready,
+                worker.telemetry_ready,
+                worker.log_message,
+                worker.detection_event,
+                worker.detections_payload,
+                worker.model_loaded,
+                worker.frozen,
+            ):
+                try:
+                    signal.disconnect()
+                except Exception:
+                    pass
+        for watchdog in getattr(self, "_watchdogs", []):
+            for signal in (watchdog.log_message, watchdog.restart_requested):
+                try:
+                    signal.disconnect()
+                except Exception:
+                    pass
+        try:
+            self._gpio_worker.log_message.disconnect()
+        except Exception:
+            pass
+
     def _wire_threads(self) -> None:
-        self._inference_worker.source_ready.connect(self._on_source_ready)
-        self._inference_worker.frame_ready.connect(self.video_widget.set_frame)
-        self._inference_worker.telemetry_ready.connect(self._update_telemetry)
-        self._inference_worker.log_message.connect(self._append_log)
-        self._inference_worker.detection_event.connect(self._gpio_worker.enqueue_detection)
-        self._inference_worker.model_loaded.connect(lambda model: self._set_status(f"Model: {model}"))
-        self._inference_worker.frozen.connect(lambda: self._report_error("Inference frozen", RuntimeError("watchdog will restart worker")))
+        primary = self._inference_workers[0]
+        primary.source_ready.connect(self._on_source_ready)
+        primary.telemetry_ready.connect(self._update_telemetry)
+        primary.model_loaded.connect(lambda model: self._set_status(f"Model: {model}"))
+
+        tiles = getattr(self, "_tiles", None) or [self.video_widget]
+        for index, worker in enumerate(self._inference_workers):
+            tile = tiles[index] if index < len(tiles) else self.video_widget
+            worker.frame_ready.connect(tile.set_frame)
+            worker.frame_ready.connect(
+                lambda frame, cam=worker.camera_id: self._publish_inference_outputs(frame, cam)
+            )
+            worker.frame_ready.connect(lambda _frame, idx=index: self._on_tile_frame(idx))
+            worker.log_message.connect(self._append_log)
+            worker.detection_event.connect(self._gpio_worker.enqueue_detection)
+            worker.frozen.connect(
+                lambda cam=worker.camera_id: self._handle_worker_frozen(cam)
+            )
         self._gpio_worker.log_message.connect(self._append_log)
-        self._watchdog.log_message.connect(self._append_log)
-        self._watchdog.restart_requested.connect(self._restart_inference)
+        for watchdog in self._watchdogs:
+            watchdog.log_message.connect(self._append_log)
+            watchdog.restart_requested.connect(self._restart_inference)
 
     def _start_threads(self) -> None:
         self._append_log(f"Selected backend: {self._hardware.info.camera_backend} / {self._hardware.info.gpio_backend}")
         self._append_log(f"Video input mode: {self._video_source_config.mode}")
         self._append_log(f"Recommended model format: {self._hardware.info.recommended_model_format}")
+        if len(self._inference_workers) > 1:
+            cam_list = ", ".join(w.camera_id for w in self._inference_workers)
+            self._append_log(f"Multi-camera pool active ({len(self._inference_workers)}): {cam_list}")
+        self._refresh_pool_banner()
+        self._output_dispatcher.start()
         self._gpio_worker.start()
-        self._inference_worker.start()
-        self._watchdog.start()
+        for worker in self._inference_workers:
+            worker.start()
+        for watchdog in self._watchdogs:
+            watchdog.start()
 
     def _append_log(self, message: str) -> None:
         self.console.appendPlainText(message)
         self.statusBar().showMessage(message, 5000)
+        log.info(message)
+
+    def _publish_inference_outputs(self, frame: object, camera_id: str) -> None:
+        if isinstance(frame, dict):
+            self._output_dispatcher.publish(inference_payload_from_frame(frame, camera_id=camera_id))
 
     def _update_telemetry(self, telemetry: dict) -> None:
         self._latest_telemetry = dict(telemetry)
-        self.fps_capture.setText(f"{telemetry.get('capture_fps', 0.0):.1f}")
-        self.fps_inference.setText(f"{telemetry.get('inference_fps', 0.0):.1f}")
-        self.latency.setText(f"{telemetry.get('latency_ms', 0.0):.1f} ms")
+        capture_fps = float(telemetry.get('capture_fps', 0.0))
+        inference_fps = float(telemetry.get('inference_fps', 0.0))
+        latency_ms = float(telemetry.get('latency_ms', 0.0))
+        self.fps_capture.setText(f"{capture_fps:.1f}")
+        self.fps_inference.setText(f"{inference_fps:.1f}")
+        self.latency.setText(f"{latency_ms:.1f} ms")
         self.ram.setText(f"{telemetry.get('ram_mb', 0.0):.0f} MB")
         self.vram.setText(f"{telemetry.get('vram_mb', 0.0):.0f} MB")
         self.temperature.setText(f"{telemetry.get('soc_temp_c', 0.0):.1f} °C")
-        self.health_bar.setValue(min(100, max(0, 100 - int(telemetry.get('latency_ms', 0.0)))))
+        self.health_bar.setValue(min(100, max(0, 100 - int(latency_ms))))
+        if hasattr(self, "fps_capture_spark"):
+            self.fps_capture_spark.push(capture_fps)
+            self.fps_inference_spark.push(inference_fps)
+            self.latency_spark.push(latency_ms)
         self._refresh_live_summary()
+        try:
+            self._telemetry_log.maybe_record(self._latest_telemetry)
+        except OSError as exc:
+            log.warning("telemetry log write failed: %s", exc)
+
+    _MAX_RESTARTS = 5
 
     def _restart_inference(self) -> None:
-        self._append_log("Restarting inference worker...")
-        self._watchdog.request_stop()
-        if self._inference_worker.isRunning():
-            self._inference_worker.request_stop()
-            self._inference_worker.wait(2000)
-        self._watchdog.wait(1000)
-        self._inference_worker = self._create_inference_worker()
-        self._watchdog = Watchdog(self._inference_worker, parent=self)
+        self._restart_count = getattr(self, "_restart_count", 0) + 1
+        if self._restart_count > self._MAX_RESTARTS:
+            self._append_log(
+                f"Watchdog: aborting auto-restart after {self._MAX_RESTARTS} attempts."
+                " Inference will stay stopped — review the source/model and restart the app."
+            )
+            return
+        self._append_log(
+            f"Restarting inference pool (attempt {self._restart_count}/{self._MAX_RESTARTS})..."
+        )
+        self._unwire_threads()
+        for watchdog in self._watchdogs:
+            watchdog.request_stop()
+        for worker in self._inference_workers:
+            if worker.isRunning():
+                worker.request_stop()
+                worker.wait(2000)
+        for watchdog in self._watchdogs:
+            watchdog.wait(1000)
+
+        self._inference_workers = self._create_inference_workers()
+        self._inference_worker = self._inference_workers[0]
+        self._watchdogs = [Watchdog(worker, parent=self) for worker in self._inference_workers]
+        self._watchdog = self._watchdogs[0]
+        self._frozen_cameras = set()
+        self._rebuild_video_view()
         self._wire_threads()
-        self._watchdog.start()
-        self._inference_worker.start()
+        for watchdog in self._watchdogs:
+            watchdog.start()
+        for worker in self._inference_workers:
+            worker.start()
+        self._refresh_pool_banner()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self.shutdown()
+        super().closeEvent(event)
+
+    def shutdown(self) -> None:
+        """Idempotent teardown: stop threads, flush configs, release captures."""
+        if getattr(self, "_shutdown_started", False):
+            return
+        self._shutdown_started = True
+
         try:
             self.forge_panel.save_state()
-        except Exception:
-            pass
+        except Exception as exc:
+            self._append_log(f"Forge panel state save failed: {exc}")
         try:
             save_inference_source_config(VIDEO_SOURCE_PATH, self._video_source_config)
-        except Exception:
-            pass
-        self._watchdog.request_stop()
+        except OSError as exc:
+            self._append_log(f"Video source config save failed: {exc}")
+
+        for async_worker in list(self._workers):
+            try:
+                async_worker.cancel()
+            except RuntimeError:
+                pass
+        for async_worker in list(self._workers):
+            if async_worker.isRunning():
+                async_worker.wait(1500)
+
+        for watchdog in self._watchdogs:
+            watchdog.request_stop()
+        self._output_dispatcher.stop()
         self._gpio_worker.request_stop()
-        self._inference_worker.request_stop()
-        self._watchdog.wait(1000)
-        self._gpio_worker.wait(1000)
-        self._inference_worker.wait(1000)
-        super().closeEvent(event)
+        for worker in self._inference_workers:
+            worker.request_stop()
+        for watchdog in self._watchdogs:
+            watchdog.wait(1500)
+        self._gpio_worker.wait(1500)
+        for worker in self._inference_workers:
+            worker.wait(2500)
+        try:
+            self._gpio_worker._backend.close()
+        except Exception as exc:
+            log.warning("GPIO backend close failed: %s", exc)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="EdgeVision Control Hub")
     parser.add_argument("--headless", action="store_true", help="Run without opening the Qt UI")
+    parser.add_argument(
+        "--health",
+        action="store_true",
+        help="Validate config + ping Forge and exit (0=healthy, 1=unhealthy)",
+    )
     args = parser.parse_args()
 
+    settings = Settings.load(".env")
+    log_path = configure_logging(log_dir=Path(settings.log_dir) if settings.log_dir else None)
+    log.info("EdgeVision Control Hub starting (log file: %s)", log_path)
+
+    if args.health:
+        return run_healthcheck(settings)
     if args.headless:
-        return run_headless()
+        return run_headless(settings)
+
+    problems = settings.validate()
+    for problem in problems:
+        log.warning("settings: %s", problem)
 
     app = QApplication([])
     app.setFont(QFont("Inter", 10))
-    hardware = HardwareManager()
-    window = MainWindow(hardware)
+    hardware = _hardware_for(settings)
+    window = MainWindow(hardware, settings=settings)
     window.show()
+    install_signal_handlers(app.quit)
+    app.aboutToQuit.connect(window.shutdown)
     return app.exec()
 
 
-def run_headless() -> int:
-    env = read_env_file(Path(".env"))
-    hardware = HardwareManager()
+def _hardware_for(settings: Settings) -> HardwareManager:
+    forced = settings.hardware_override or None
+    if settings.simulation_mode:
+        return HardwareManager(force_simulation=True)
+    if forced:
+        return HardwareManager(forced_kind=forced)
+    return HardwareManager()
+
+
+def run_healthcheck(settings: Settings | None = None) -> int:
+    """Validate config + ping Forge. Returns 0 if healthy, 1 otherwise."""
+    settings = settings or Settings.load(".env")
+    problems: list[str] = list(settings.validate())
+
+    if settings.has_forge_credentials and settings.forge_url:
+        forge = ForgeManager(settings.forge_url, retry_attempts=settings.http_retry_attempts)
+        if settings.forge_token:
+            forge.set_token(settings.forge_token)
+        elif settings.forge_username and settings.forge_password:
+            forge.set_basic_auth(settings.forge_username, settings.forge_password)
+        try:
+            forge.ping()
+            print("forge: ok")
+        except Exception as exc:
+            problems.append(f"forge ping failed: {exc}")
+
+    if problems:
+        for problem in problems:
+            print(f"unhealthy: {problem}")
+        return 1
+    print("healthy")
+    return 0
+
+
+def run_headless(settings: Settings | None = None) -> int:
+    settings = settings or Settings.load(".env")
+    for problem in settings.validate():
+        print(f"warning: {problem}")
+    hardware = _hardware_for(settings)
     print("EdgeVision Control Hub headless mode")
     print(f"Hardware: {hardware.info.name}")
     print(f"Recommended model format: {hardware.info.recommended_model_format}")
-    print(f"Forge URL: {env.get('FORGE_URL', '')}")
-    print(f"CVAT URL: {env.get('CVAT_URL', 'https://app.cvat.ai')}")
+    print(f"Forge URL: {settings.forge_url}")
     for i in range(3):
         print(f"Cycle {i + 1}: capture -> inference -> gpio dispatch")
         time.sleep(0.2)
