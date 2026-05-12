@@ -24,10 +24,25 @@
   "camera_source": "/dev/video0",
   "camera_label": "Webcam video0",
   "camera_backend": "v4l2",
-  "local_cameras": [],
-  "last_resolved_source": "rtsp://admin:12345678@192.168.100.21:554/live",
-  "last_resolved_label": "Cam 192.168.100.21",
-  "last_resolved_kind": "rtsp",
-  "last_resolved_backend": "ffmpeg",
+  "local_cameras": [
+    {
+      "name": "Webcam video0",
+      "kind": "webcam",
+      "source": "/dev/video0",
+      "backend": "v4l2",
+      "enabled": true
+    },
+    {
+      "name": "Webcam video2",
+      "kind": "webcam",
+      "source": "/dev/video2",
+      "backend": "v4l2",
+      "enabled": true
+    }
+  ],
+  "last_resolved_source": "",
+  "last_resolved_label": "Sin fuente de video",
+  "last_resolved_kind": "simulation",
+  "last_resolved_backend": "",
   "discovered_sources": []
 }

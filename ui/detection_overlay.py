@@ -48,6 +48,7 @@ class DetectionHistogram(QWidget):
         if not active:
             painter.setPen(QPen(QColor("#3a4452")))
             painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), "sin detecciones recientes")
+            painter.end()
             return
 
         counts: dict[str, int] = {}
@@ -77,3 +78,4 @@ class DetectionHistogram(QWidget):
             y += row_height + 2
             if y > rect.bottom():
                 break
+        painter.end()

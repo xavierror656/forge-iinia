@@ -38,6 +38,7 @@ class Sparkline(QWidget):
         if len(self._values) < 2:
             painter.setPen(QPen(QColor("#3a4452")))
             painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), "—")
+            painter.end()
             return
 
         values = list(self._values)
@@ -69,3 +70,4 @@ class Sparkline(QWidget):
 
         painter.setPen(QPen(QColor("#9fb2c8")))
         painter.drawText(rect.adjusted(4, 0, -4, 0), int(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight), f"{values[-1]:.1f}")
+        painter.end()

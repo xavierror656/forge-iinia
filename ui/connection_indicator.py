@@ -70,3 +70,4 @@ class _Dot(QWidget):
         painter.setBrush(self._color)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(self.rect())
+        painter.end()

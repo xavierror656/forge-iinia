@@ -277,6 +277,7 @@ class EmptyMessageMixin:
             int(Qt.AlignmentFlag.AlignCenter) | int(Qt.TextFlag.TextWordWrap),
             self._empty_message,
         )
+        painter.end()
 
 
 class PlainList(EmptyMessageMixin, QListWidget):

@@ -50,6 +50,7 @@ class _Led(QWidget):
         painter.setBrush(glow)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 3, 3)
+        painter.end()
 
 
 class GPIOLedStrip(QWidget):
