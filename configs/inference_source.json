@@ -25,9 +25,9 @@
   "camera_label": "Webcam video0",
   "camera_backend": "v4l2",
   "local_cameras": [],
-  "last_resolved_source": "rtsp://admin:12345678@192.168.100.21:554/live",
-  "last_resolved_label": "Cam 192.168.100.21",
-  "last_resolved_kind": "rtsp",
-  "last_resolved_backend": "ffmpeg",
+  "last_resolved_source": "",
+  "last_resolved_label": "Sin fuente de video",
+  "last_resolved_kind": "simulation",
+  "last_resolved_backend": "",
   "discovered_sources": []
 }

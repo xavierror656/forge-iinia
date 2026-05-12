@@ -13,15 +13,19 @@ from PyQt6.QtWidgets import QWidget
 class OpenGLVideoWidget(QOpenGLWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._image: QImage | None = None
+        self._raw_image: QImage | None = None
+        self._scaled_image: QImage | None = None
+        self._blit_x = 0
+        self._blit_y = 0
+        self._scale_x = 1.0
+        self._scale_y = 1.0
         self._status_text = "Esperando stream..."
         self._detections: list[dict[str, Any]] = []
-        self._frame_size: tuple[int, int] | None = None
         self.setMinimumHeight(360)
 
     def set_frame(self, frame: Any) -> None:
-        self._image = None
-        self._frame_size = None
+        self._raw_image = None
+        self._scaled_image = None
         if isinstance(frame, dict):
             status = frame.get("status") or frame.get("source_label") or frame.get("source") or "Stream activo"
             self._status_text = str(status)
@@ -30,17 +34,13 @@ class OpenGLVideoWidget(QOpenGLWidget):
                 self._detections = list(detections)
             image = frame.get("image")
             if isinstance(image, QImage):
-                self._image = image
-            frame_size = frame.get("frame_size")
-            if isinstance(frame_size, (tuple, list)) and len(frame_size) == 2:
-                try:
-                    self._frame_size = (int(frame_size[0]), int(frame_size[1]))
-                except (TypeError, ValueError):
-                    self._frame_size = None
+                self._raw_image = image
         elif isinstance(frame, QImage):
-            self._image = frame
+            self._raw_image = frame
         else:
             self._status_text = "Esperando stream..."
+        if self._raw_image is not None:
+            self._recompute_scale()
         self.update()
 
     def set_status(self, text: str) -> None:
@@ -51,46 +51,54 @@ class OpenGLVideoWidget(QOpenGLWidget):
         self._detections = list(detections)
         self.update()
 
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._scaled_image = None  # invalidate; recompute on next paint if raw available
+        if self._raw_image is not None:
+            self._recompute_scale()
+
+    def _recompute_scale(self) -> None:
+        img = self._raw_image
+        if img is None or img.isNull():
+            self._scaled_image = None
+            return
+        scaled = img.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+        self._scaled_image = scaled
+        self._blit_x = (self.width() - scaled.width()) // 2
+        self._blit_y = (self.height() - scaled.height()) // 2
+        self._scale_x = scaled.width() / max(1, img.width())
+        self._scale_y = scaled.height() / max(1, img.height())
+
     def paintGL(self) -> None:
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#111318"))
-        if self._image is not None and not self._image.isNull():
-            scaled = self._image.scaled(
-                self.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            x_offset = (self.width() - scaled.width()) // 2
-            y_offset = (self.height() - scaled.height()) // 2
-            painter.drawImage(QPoint(x_offset, y_offset), scaled)
 
-            img_width = max(1, self._image.width())
-            img_height = max(1, self._image.height())
-            scale_x = scaled.width() / img_width
-            scale_y = scaled.height() / img_height
+        if self._scaled_image is not None and not self._scaled_image.isNull():
+            painter.drawImage(QPoint(self._blit_x, self._blit_y), self._scaled_image)
 
             for det in self._detections:
                 bbox = det.get("bbox") or (0.1, 0.1, 0.3, 0.3)
                 if not isinstance(bbox, (tuple, list)) or len(bbox) != 4:
                     continue
                 try:
-                    x1, y1, x2, y2 = (float(value) for value in bbox)
+                    x1, y1, x2, y2 = (float(v) for v in bbox)
                 except (TypeError, ValueError):
                     continue
 
+                sw, sh = self._scaled_image.width(), self._scaled_image.height()
                 if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.5:
                     rect = QRectF(
-                        x_offset + x1 * scaled.width(),
-                        y_offset + y1 * scaled.height(),
-                        (x2 - x1) * scaled.width(),
-                        (y2 - y1) * scaled.height(),
+                        self._blit_x + x1 * sw,
+                        self._blit_y + y1 * sh,
+                        (x2 - x1) * sw,
+                        (y2 - y1) * sh,
                     )
                 else:
                     rect = QRectF(
-                        x_offset + x1 * scale_x,
-                        y_offset + y1 * scale_y,
-                        (x2 - x1) * scale_x,
-                        (y2 - y1) * scale_y,
+                        self._blit_x + x1 * self._scale_x,
+                        self._blit_y + y1 * self._scale_y,
+                        (x2 - x1) * self._scale_x,
+                        (y2 - y1) * self._scale_y,
                     )
 
                 color_hex = det.get("color") or self._label_color(str(det.get("label", "")))
@@ -108,15 +116,16 @@ class OpenGLVideoWidget(QOpenGLWidget):
                     fm = painter.fontMetrics()
                     tw = fm.horizontalAdvance(text) + 8
                     th = fm.height() + 4
-                    banner_x = int(max(0, rect.x()))
-                    banner_y = int(max(0, rect.y() - th))
-                    painter.fillRect(QRectF(banner_x, banner_y, tw, th), color)
+                    bx = int(max(0, rect.x()))
+                    by = int(max(0, rect.y() - th))
+                    painter.fillRect(QRectF(bx, by, tw, th), color)
                     painter.setPen(QPen(QColor("#0a0c10")))
-                    painter.drawText(QPoint(banner_x + 4, banner_y + th - 4), text)
+                    painter.drawText(QPoint(bx + 4, by + th - 4), text)
 
             painter.setPen(QPen(QColor("#0a0c10")))
+            fm = painter.fontMetrics()
             painter.fillRect(
-                QRectF(12, 12, max(220, painter.fontMetrics().horizontalAdvance(self._status_text) + 20), 26),
+                QRectF(12, 12, max(220, fm.horizontalAdvance(self._status_text) + 20), 26),
                 QColor(0, 0, 0, 150),
             )
             painter.setPen(QPen(QColor("#e6eaf2")))
@@ -131,5 +140,4 @@ class OpenGLVideoWidget(QOpenGLWidget):
         palette = ["#62d2a2", "#5aa9e6", "#f4b942", "#e66b6b", "#b57ff5", "#7ad3c8"]
         if not label:
             return palette[0]
-        index = sum(ord(ch) for ch in label) % len(palette)
-        return palette[index]
+        return palette[sum(ord(ch) for ch in label) % len(palette)]
