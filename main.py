@@ -407,7 +407,9 @@ class InferenceWorker(QThread):
             self.log_message.emit("Video source unavailable, using simulated preview.")
 
     def _start_reader(self) -> None:
-        """Start a background thread that continuously reads frames into a 1-slot buffer."""
+        """Async frame reader — Jetson only. Decouples camera I/O from the inference loop."""
+        if self._hardware.info.kind != "jetson":
+            return  # non-Jetson platforms use blocking capture.read() in the inference loop
         self._reader_stop = threading.Event()
         cap_ref = self._capture
 
@@ -548,16 +550,29 @@ class InferenceWorker(QThread):
         simulation = self._capture is None
 
         if self._capture is not None:
-            with self._frame_lock:
-                frame = self._latest_frame
-            if frame is not None:
+            if self._hardware.info.kind == "jetson":
+                # Jetson: read from async buffer filled by background reader thread
+                with self._frame_lock:
+                    frame = self._latest_frame
+                ok = frame is not None
+            else:
+                # Non-Jetson (raspberry, development): simple blocking read
+                ok, frame = self._capture.read()
+
+            if ok and frame is not None:
                 raw_frame = frame
                 frame_size = (int(frame.shape[1]), int(frame.shape[0]))
                 self._read_failures = 0
                 simulation = False
+                if self._hardware.info.kind != "jetson":
+                    self._telemetry.record_capture()
             else:
-                # Reader thread hasn't delivered a frame yet (startup) or stream lost
-                if self._reader_thread is not None and not self._reader_thread.is_alive():
+                lost = (
+                    self._reader_thread is not None and not self._reader_thread.is_alive()
+                    if self._hardware.info.kind == "jetson"
+                    else True
+                )
+                if lost:
                     self._read_failures += 1
                     if self._read_failures >= 3:
                         self.log_message.emit("Video source lost. Retrying...")

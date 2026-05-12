@@ -23,7 +23,7 @@ def load_model(model_path: Path, *, device: str = "") -> Any:
     return model
 
 
-def export_tensorrt(
+def export_tensorrt(  # Jetson / CUDA only
     model_path: Path,
     *,
     half: bool = True,
@@ -45,6 +45,11 @@ def export_tensorrt(
     Returns:
         Path to the generated .engine file (same directory as source model).
     """
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "TensorRT export requiere CUDA. "
+            "En Jetson asegúrate de que torch fue instalado con soporte CUDA."
+        )
     if not model_path.exists():
         raise FileNotFoundError(f"Modelo no encontrado: {model_path}")
 

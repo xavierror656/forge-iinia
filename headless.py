@@ -315,6 +315,219 @@ class BatchInferenceWorker(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
+# Platform-specific runners
+# ---------------------------------------------------------------------------
+
+def _run_jetson(
+    *,
+    args: Any,
+    settings: Settings,
+    hardware: HardwareManager,
+    model_path: Path,
+    preloaded_model: Any,
+    gpio_worker: GPIOWorker,
+    output_dispatcher: InferenceOutputDispatcher,
+    candidates: list[Any],
+    watchdog_timeout: float,
+    stop_event: threading.Event,
+) -> None:
+    """Jetson path: async CaptureWorker × N + single BatchInferenceWorker."""
+    capture_workers = [
+        CaptureWorker(src, is_jetson=True, camera_id=str(idx))
+        for idx, src in enumerate(candidates)
+    ]
+
+    preview_queues: dict[str, queue.Queue[Any]] = (
+        {str(idx): queue.Queue(maxsize=1) for idx in range(len(capture_workers))}
+        if args.preview and capture_workers else {}
+    )
+
+    def _make_batch_worker() -> BatchInferenceWorker:
+        return BatchInferenceWorker(
+            model=preloaded_model,
+            capture_workers=capture_workers,
+            gpio_worker=gpio_worker,
+            output_dispatcher=output_dispatcher,
+            conf=args.conf,
+            imgsz=args.imgsz,
+            print_detections=args.print_detections,
+            detections_format=args.detections_format,
+            preview_queues=preview_queues,
+        )
+
+    batch_worker = _make_batch_worker()
+
+    def on_freeze() -> None:
+        nonlocal batch_worker
+        log.warning("Reiniciando batch inference worker...")
+        batch_worker.stop()
+        batch_worker.join(timeout=3.0)
+        batch_worker = _make_batch_worker()
+        batch_worker.start()
+
+    watchdog = Watchdog(
+        get_heartbeat=batch_worker.heartbeat,
+        timeout_s=watchdog_timeout,
+        on_freeze=on_freeze,
+    )
+
+    gpio_worker.start()
+    for cw in capture_workers:
+        cw.start()
+    batch_worker.start()
+    watchdog.start()
+
+    log.info(
+        "Jetson: %d cámara(s), batch inference, modelo=%s, conf=%.2f, imgsz=%d",
+        len(capture_workers), model_path.name, args.conf, args.imgsz,
+    )
+
+    if args.preview and preview_queues:
+        while not stop_event.is_set():
+            for cam_id, pq in preview_queues.items():
+                try:
+                    cid, frame = pq.get_nowait()
+                    cv2.imshow(f"Cam {cid}", frame)
+                except queue.Empty:
+                    pass
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                stop_event.set()
+                break
+        cv2.destroyAllWindows()
+    else:
+        stop_event.wait()
+
+    watchdog.stop()
+    batch_worker.stop()
+    for cw in capture_workers:
+        cw.stop()
+    gpio_worker.stop()
+    batch_worker.join(timeout=5.0)
+    for cw in capture_workers:
+        cw.join(timeout=3.0)
+    gpio_worker.join(timeout=3.0)
+
+
+def _run_simple(
+    *,
+    args: Any,
+    settings: Settings,
+    hardware: HardwareManager,
+    model_path: Path,
+    preloaded_model: Any,
+    gpio_worker: GPIOWorker,
+    output_dispatcher: InferenceOutputDispatcher,
+    candidates: list[Any],
+    watchdog_timeout: float,
+    stop_event: threading.Event,
+) -> None:
+    """Non-Jetson path: simple per-camera inference loop, blocking capture.read().
+
+    Placeholder for future Raspberry Pi / OpenVINO support.
+    Each platform (raspi, openvino) will add its own runner here when ready.
+    """
+    import cv2 as _cv2
+
+    device = "cpu"
+
+    gpio_worker.start()
+    log.info(
+        "Simple: %d cámara(s), modelo=%s, conf=%.2f, imgsz=%d, device=%s",
+        len(candidates), model_path.name, args.conf, args.imgsz, device,
+    )
+
+    active_states: dict[str, dict[str, bool]] = {}
+
+    def _dispatch_gpio(detections: list[dict], cam_id: str) -> None:
+        states = active_states.setdefault(cam_id, {})
+        current = {d["label"] for d in detections}
+        for d in detections:
+            lbl = d["label"]
+            if not states.get(lbl):
+                states[lbl] = True
+                gpio_worker.enqueue(lbl, cam_id, True)
+        for lbl in list(states):
+            if states[lbl] and lbl not in current:
+                states[lbl] = False
+                gpio_worker.enqueue(lbl, cam_id, False)
+
+    while not stop_event.is_set():
+        for idx, src in enumerate(candidates):
+            from core.video_source import open_capture
+            cap = open_capture(src, is_jetson=False)
+            if cap is None:
+                time.sleep(2.0)
+                continue
+            log.info("cam %s: abierta → %s", idx, src.source)
+            failures = 0
+            while not stop_event.is_set():
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    failures += 1
+                    if failures >= 5:
+                        break
+                    continue
+                failures = 0
+                if preloaded_model is None:
+                    continue
+                try:
+                    results = preloaded_model.predict(
+                        frame, verbose=False, conf=args.conf,
+                        imgsz=args.imgsz, device=device,
+                    )
+                except Exception as exc:
+                    log.warning("Inferencia fallida: %s", exc)
+                    continue
+                if not results:
+                    continue
+                cam_id = str(idx)
+                boxes = getattr(results[0], "boxes", None)
+                names = getattr(results[0], "names", {}) or {}
+                detections: list[dict] = []
+                if boxes is not None:
+                    try:
+                        for bbox, cls_id, conf_v in zip(
+                            boxes.xyxy.cpu().tolist(),
+                            boxes.cls.cpu().tolist(),
+                            boxes.conf.cpu().tolist(),
+                        ):
+                            lbl = str(names.get(int(cls_id), int(cls_id)))
+                            detections.append({
+                                "label": lbl,
+                                "confidence": round(float(conf_v), 4),
+                                "bbox": [round(float(v), 2) for v in bbox[:4]],
+                                "class_id": int(cls_id),
+                            })
+                    except Exception:
+                        pass
+                _dispatch_gpio(detections, cam_id)
+                h, w = frame.shape[:2]
+                output_dispatcher.publish(inference_payload_from_frame(
+                    {"detections": detections, "source": "", "source_label": "",
+                     "simulation": False, "frame_size": (w, h)},
+                    camera_id=cam_id,
+                ))
+                if args.print_detections and detections:
+                    ts = time.strftime("%H:%M:%S")
+                    labels = ", ".join(f"{d['label']} ({d['confidence']:.0%})" for d in detections)
+                    sys.stdout.write(f"[{ts}][cam {cam_id}] {len(detections)} det — {labels}\n")
+                    sys.stdout.flush()
+                if args.preview:
+                    _cv2.imshow(f"Cam {cam_id}", frame)
+                    if _cv2.waitKey(1) & 0xFF == ord("q"):
+                        stop_event.set()
+                        break
+            cap.release()
+        if not candidates:
+            stop_event.wait(timeout=5.0)
+
+    if args.preview:
+        _cv2.destroyAllWindows()
+    gpio_worker.stop()
+    gpio_worker.join(timeout=3.0)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -367,8 +580,11 @@ def main() -> None:
     model_path = Path(args.model) if args.model else _find_model(settings)
     log.info("Modelo: %s", model_path)
 
-    # TensorRT export mode — export and exit
+    # TensorRT export — Jetson/CUDA only
     if args.export_trt:
+        if hardware.info.kind != "jetson":
+            log.error("--export-trt solo está disponible en Jetson (CUDA requerido)")
+            sys.exit(1)
         try:
             engine_path = export_tensorrt(
                 model_path,
@@ -431,50 +647,9 @@ def main() -> None:
 
     is_jetson = hardware.info.kind == "jetson"
 
-    # One CaptureWorker per camera — async frame buffer with backoff reconnection
-    capture_workers = [
-        CaptureWorker(src, is_jetson=is_jetson, camera_id=str(idx))
-        for idx, src in enumerate(candidates)
-    ]
-
-    # Per-camera preview queues (maxsize=1 → main thread always gets latest frame)
-    preview_queues: dict[str, queue.Queue[Any]] = (
-        {str(idx): queue.Queue(maxsize=1) for idx in range(len(capture_workers))}
-        if args.preview and capture_workers else {}
-    )
-
     watchdog_timeout = (
         args.watchdog_timeout if args.watchdog_timeout > 0
         else settings.watchdog_timeout_seconds
-    )
-
-    def _make_batch_worker() -> BatchInferenceWorker:
-        return BatchInferenceWorker(
-            model=preloaded_model,
-            capture_workers=capture_workers,
-            gpio_worker=gpio_worker,
-            output_dispatcher=output_dispatcher,
-            conf=args.conf,
-            imgsz=args.imgsz,
-            print_detections=args.print_detections,
-            detections_format=args.detections_format,
-            preview_queues=preview_queues,
-        )
-
-    batch_worker = _make_batch_worker()
-
-    def on_freeze() -> None:
-        nonlocal batch_worker
-        log.warning("Reiniciando batch inference worker...")
-        batch_worker.stop()
-        batch_worker.join(timeout=3.0)
-        batch_worker = _make_batch_worker()
-        batch_worker.start()
-
-    watchdog = Watchdog(
-        get_heartbeat=batch_worker.heartbeat,
-        timeout_s=watchdog_timeout,
-        on_freeze=on_freeze,
     )
 
     stop_event = threading.Event()
@@ -486,46 +661,33 @@ def main() -> None:
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    # Start all workers
-    gpio_worker.start()
-    for cw in capture_workers:
-        cw.start()
-    batch_worker.start()
-    watchdog.start()
-
-    log.info(
-        "EdgeVision headless iniciado — %d cámara(s), modelo=%s, conf=%.2f, imgsz=%d",
-        len(capture_workers), model_path.name, args.conf, args.imgsz,
-    )
-
-    # Preview loop must run in main thread (cv2.imshow is not thread-safe with Qt backend)
-    if args.preview and preview_queues:
-        while not stop_event.is_set():
-            for cam_id, pq in preview_queues.items():
-                try:
-                    cid, frame = pq.get_nowait()
-                    cv2.imshow(f"Cam {cid}", frame)
-                except queue.Empty:
-                    pass
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
-                stop_event.set()
-                break
-        cv2.destroyAllWindows()
+    if is_jetson:
+        _run_jetson(
+            args=args,
+            settings=settings,
+            hardware=hardware,
+            model_path=model_path,
+            preloaded_model=preloaded_model,
+            gpio_worker=gpio_worker,
+            output_dispatcher=output_dispatcher,
+            candidates=candidates,
+            watchdog_timeout=watchdog_timeout,
+            stop_event=stop_event,
+        )
     else:
-        stop_event.wait()
-
-    log.info("Deteniendo...")
-    watchdog.stop()
-    batch_worker.stop()
-    for cw in capture_workers:
-        cw.stop()
-    gpio_worker.stop()
-
-    batch_worker.join(timeout=5.0)
-    for cw in capture_workers:
-        cw.join(timeout=3.0)
-    gpio_worker.join(timeout=3.0)
+        log.info("Plataforma no-Jetson — usando modo simple (sin batch/async/TensorRT)")
+        _run_simple(
+            args=args,
+            settings=settings,
+            hardware=hardware,
+            model_path=model_path,
+            preloaded_model=preloaded_model,
+            gpio_worker=gpio_worker,
+            output_dispatcher=output_dispatcher,
+            candidates=candidates,
+            watchdog_timeout=watchdog_timeout,
+            stop_event=stop_event,
+        )
 
     output_dispatcher.stop()
     log.info("EdgeVision headless detenido.")
