@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "mode": "rtsp",
+  "mode": "webcam",
   "rtsp_url": "rtsp://192.168.100.21:554/live",
   "rtsp_username": "admin",
   "rtsp_password": "12345678",
@@ -8,13 +8,6 @@
   "rtsp_cameras": [
     {
       "name": "Cam 192.168.100.21",
-      "url": "rtsp://192.168.100.21:554/live",
-      "username": "admin",
-      "password": "12345678",
-      "enabled": true
-    },
-    {
-      "name": "Cam 192.168.100.21 (2)",
       "url": "rtsp://192.168.100.21:554/live",
       "username": "admin",
       "password": "12345678",
@@ -40,9 +33,9 @@
       "enabled": true
     }
   ],
-  "last_resolved_source": "",
-  "last_resolved_label": "Sin fuente de video",
-  "last_resolved_kind": "simulation",
-  "last_resolved_backend": "",
+  "last_resolved_source": "/dev/video0",
+  "last_resolved_label": "Webcam video0",
+  "last_resolved_kind": "webcam",
+  "last_resolved_backend": "v4l2",
   "discovered_sources": []
 }

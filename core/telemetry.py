@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import os
+import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from core.hardware_manager import HardwareManager
+
+_WINDOW = 30  # frames to keep for rolling FPS
 
 
 @dataclass(slots=True)
@@ -27,18 +31,41 @@ class TelemetryCollector:
     def __init__(self, hardware: HardwareManager) -> None:
         self._hardware = hardware
         self._page_size = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+        # Separate rolling windows for capture rate and inference latency
+        self._frame_ts: deque[float] = deque(maxlen=_WINDOW)   # wall time of each captured frame
+        self._infer_ts: deque[float] = deque(maxlen=_WINDOW)   # wall time after inference done
+        self._infer_ms: deque[float] = deque(maxlen=_WINDOW)   # pure inference duration (ms)
 
-    def snapshot(self, *, elapsed_seconds: float) -> TelemetrySnapshot:
-        fps = 1.0 / max(0.001, elapsed_seconds)
+    def record_capture(self) -> None:
+        """Call immediately after a successful capture.read()."""
+        self._frame_ts.append(time.perf_counter())
+
+    def record_inference(self, inference_ms: float) -> None:
+        """Call immediately after model.predict(), with its duration in ms."""
+        self._infer_ts.append(time.perf_counter())
+        self._infer_ms.append(inference_ms)
+
+    def snapshot(self) -> TelemetrySnapshot:
         return TelemetrySnapshot(
-            capture_fps=fps,
-            inference_fps=fps,
-            latency_ms=elapsed_seconds * 1000.0,
+            capture_fps=self._rolling_fps(self._frame_ts),
+            inference_fps=self._rolling_fps(self._infer_ts),
+            latency_ms=self._rolling_mean(self._infer_ms),
             ram_mb=self._process_ram_mb(),
             vram_mb=0.0,
             soc_temp_c=self._soc_temp_c(),
             provider_name=self._hardware.info.name,
         )
+
+    @staticmethod
+    def _rolling_fps(ts: deque[float]) -> float:
+        if len(ts) < 2:
+            return 0.0
+        span = ts[-1] - ts[0]
+        return (len(ts) - 1) / span if span > 0.001 else 0.0
+
+    @staticmethod
+    def _rolling_mean(vals: deque[float]) -> float:
+        return sum(vals) / len(vals) if vals else 0.0
 
     def _process_ram_mb(self) -> float:
         statm = Path("/proc/self/statm")

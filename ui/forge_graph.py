@@ -235,6 +235,16 @@ class ForgeGraphWidget(QWidget):
         self._graph.node_double_clicked.connect(self._emit_node_activated)
         layout.addWidget(self._graph.widget, 1)
 
+        # Guard against RuntimeError when a PortItem is deleted while a pipe
+        # drag is still in progress (e.g. graph refreshed mid-drag).
+        _orig_smme = self._graph.viewer().sceneMouseMoveEvent
+        def _safe_smme(event: object) -> None:
+            try:
+                _orig_smme(event)
+            except RuntimeError:
+                self._reset_live_pipe()
+        self._graph.viewer().sceneMouseMoveEvent = _safe_smme
+
     # -- public setters -------------------------------------------------------
 
     def set_project(self, name: str) -> None:
@@ -311,6 +321,7 @@ class ForgeGraphWidget(QWidget):
             self._saved_positions = self._capture_node_positions()
             self._saved_viewport = self._capture_viewport()
 
+        self._reset_live_pipe()
         self._syncing = True
         self._graph.clear_session()
         self._node_meta = {}
@@ -426,6 +437,21 @@ class ForgeGraphWidget(QWidget):
             self._graph.viewer().centerOn(cx, cy)
         except Exception:
             self.fit()
+
+    def _reset_live_pipe(self) -> None:
+        """Cancel any in-progress port drag so clear_session() can't leave dangling C++ refs."""
+        if self._graph is None:
+            return
+        try:
+            viewer = self._graph.viewer()
+            lp = getattr(viewer, "_LIVE_PIPE", None)
+            if lp is not None:
+                lp.reset_path()
+                lp.setVisible(False)
+            if hasattr(viewer, "_start_port"):
+                viewer._start_port = None
+        except Exception:
+            pass
 
     # -- internal helpers -----------------------------------------------------
 

@@ -559,7 +559,7 @@ class SettingsPanel(QWidget):
                     self.rtsp_list.blockSignals(False)
                     self._highlight_card(entry["index"])
                     break
-        elif self.rtsp_cameras:
+        elif self._rtsp_cameras:
             self.rtsp_list.blockSignals(True)
             self.rtsp_list.setCurrentRow(0)
             self.rtsp_list.blockSignals(False)

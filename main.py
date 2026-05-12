@@ -86,9 +86,9 @@ from core.video_source import (
     VIDEO_SOURCE_PATH,
     InferenceSourceConfig,
     VideoSourceChoice,
-    build_rtsp_gstreamer_pipeline,
     capture_backend_for,
     load_inference_source_config,
+    open_capture,
     resolve_video_source_candidates,
     save_inference_source_config,
 )
@@ -147,8 +147,13 @@ class InferenceWorker(QThread):
         self._last_source_signature: tuple[Any, ...] | None = None
         self._read_failures = 0
         self._camera_id = camera_id
+        self._device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        self._use_half = self._device.startswith("cuda")
         self._forced_choice = forced_choice
         self._model: Any = None
+        self._last_ui_emit: float = 0.0
+        _UI_FPS = 15
+        self._ui_min_interval: float = 1.0 / _UI_FPS
         self._pending_model_signature: tuple[float, int] | None = None
         self._telemetry = TelemetryCollector(hardware)
 
@@ -262,8 +267,14 @@ class InferenceWorker(QThread):
         if frame is None:
             frame = self._simulation_frame()
         try:
-            _device = "cuda:0" if torch.cuda.is_available() else "cpu"
-            results = self._model.predict(frame, verbose=False, conf=0.05, device=_device)
+            results = self._model.predict(
+                frame,
+                verbose=False,
+                conf=0.25,
+                imgsz=320,
+                half=self._use_half,
+                device=self._device,
+            )
         except Exception as exc:
             self.log_message.emit(f"Model inference failed, using simulation: {exc}")
             return self._simulate_detections()
@@ -299,35 +310,7 @@ class InferenceWorker(QThread):
         return detections
 
     def _open_capture(self, choice: VideoSourceChoice) -> cv2.VideoCapture | None:
-        backend = capture_backend_for(choice)
-        source: Any = choice.source
-        if choice.kind == "rtsp" or str(source).startswith("rtsp://"):
-            if choice.backend.lower().strip() == "gstreamer" and self._hardware.info.kind == "jetson":
-                pipeline = build_rtsp_gstreamer_pipeline(str(source))
-                capture = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-                if capture.isOpened():
-                    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    return capture
-                capture.release()
-                self.log_message.emit("RTSP GStreamer no disponible, usando FFmpeg.")
-            backend = cv2.CAP_FFMPEG
-            params = [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 4000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 4000]
-            try:
-                capture = cv2.VideoCapture(source, backend, params)
-            except TypeError:
-                capture = cv2.VideoCapture(source, backend)
-        elif backend in {cv2.CAP_V4L2, cv2.CAP_ANY}:
-            match = re.match(r"^(?:/dev/video)?(\d+)$", str(source).strip())
-            if match:
-                source = int(match.group(1))
-            capture = cv2.VideoCapture(source, backend)
-        else:
-            capture = cv2.VideoCapture(source, backend)
-        if not capture.isOpened():
-            capture.release()
-            return None
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        return capture
+        return open_capture(choice, is_jetson=self._hardware.info.kind == "jetson")
 
     @staticmethod
     def _source_signature(choice: VideoSourceChoice | None, discovered: list[VideoSourceChoice], active: bool) -> tuple[Any, ...]:
@@ -468,9 +451,17 @@ class InferenceWorker(QThread):
             return
 
         try:
-            _device = "cuda:0" if torch.cuda.is_available() else "cpu"
             self._model = YOLO(str(self._model_path))
-            self._model.to(_device)
+            self._model.to(self._device)
+            # Warmup: compila el grafo y carga pesos en GPU antes del primer frame real
+            self._model.predict(
+                self._simulation_frame(),
+                verbose=False,
+                conf=0.25,
+                imgsz=320,
+                half=self._use_half,
+                device=self._device,
+            )
         except Exception as exc:
             self._model = None
             self.log_message.emit(f"Model load failed: {exc}")
@@ -480,7 +471,7 @@ class InferenceWorker(QThread):
         stat = self._model_path.stat()
         self._last_model_mtime = stat.st_mtime
         self._pending_model_signature = None
-        self.log_message.emit(f"Model loaded: {self._model_path.name} (device: {_device})")
+        self.log_message.emit(f"Model loaded: {self._model_path.name} (device: {self._device}, half={self._use_half})")
         self.model_loaded.emit(str(self._model_path))
 
     def _maybe_hot_reload(self) -> None:
@@ -512,21 +503,18 @@ class InferenceWorker(QThread):
         if self._capture is None:
             self._ensure_capture()
 
-        start = time.perf_counter()
-        image: QImage | None = None
-        frame_size: tuple[int, int] | None = None
         raw_frame: Any = None
+        frame_size: tuple[int, int] | None = None
         simulation = self._capture is None
 
         if self._capture is not None:
             ok, frame = self._capture.read()
             if ok and frame is not None:
                 raw_frame = frame
-                image = self._frame_to_qimage(frame)
-                if image is not None:
-                    frame_size = (int(frame.shape[1]), int(frame.shape[0]))
+                frame_size = (int(frame.shape[1]), int(frame.shape[0]))
                 self._read_failures = 0
                 simulation = False
+                self._telemetry.record_capture()
             else:
                 self._read_failures += 1
                 if self._read_failures >= 3:
@@ -539,38 +527,51 @@ class InferenceWorker(QThread):
 
         if raw_frame is None and simulation:
             raw_frame = self._simulation_frame()
-            image = self._frame_to_qimage(raw_frame)
             frame_size = (int(raw_frame.shape[1]), int(raw_frame.shape[0]))
             if self._model is not None:
                 self._source_status = "Simulación · inferencia real sobre frame sintético"
 
+        # Inferencia y GPIO siempre corren a máxima velocidad.
+        infer_t0 = time.perf_counter()
         detections = self._detections_from_model(raw_frame, allow_simulated=simulation)
+        self._telemetry.record_inference((time.perf_counter() - infer_t0) * 1000.0)
         self.detections_payload.emit(detections)
         self._update_detection_states(detections)
 
-        frame = {
-            "timestamp": self._last_heartbeat,
-            "provider": self._hardware.info.name,
-            "simulation": simulation,
-            "detections": detections,
-            "image": image,
-            "frame_size": frame_size,
-            "status": self._source_status,
-            "source": self._active_choice.source if self._active_choice else "",
-            "source_label": self._active_choice.label if self._active_choice else self._source_status,
-        }
-        self.frame_ready.emit(frame)
+        # La UI solo se actualiza a _UI_FPS para no saturar el hilo de renderizado.
+        now = time.perf_counter()
+        if now - self._last_ui_emit >= self._ui_min_interval:
+            self._last_ui_emit = now
+            image = self._frame_to_qimage(raw_frame) if raw_frame is not None else None
+            ui_frame = {
+                "timestamp": self._last_heartbeat,
+                "provider": self._hardware.info.name,
+                "simulation": simulation,
+                "detections": detections,
+                "image": image,
+                "frame_size": frame_size,
+                "status": self._source_status,
+                "source": self._active_choice.source if self._active_choice else "",
+                "source_label": self._active_choice.label if self._active_choice else self._source_status,
+            }
+            self.frame_ready.emit(ui_frame)
 
-        telemetry = self._telemetry.snapshot(elapsed_seconds=time.perf_counter() - start)
-        self.telemetry_ready.emit(telemetry.as_dict())
+        self.telemetry_ready.emit(self._telemetry.snapshot().as_dict())
 
     def run(self) -> None:
         self._load_model()
         try:
             while not self._stop_requested:
                 try:
+                    t0 = time.perf_counter()
                     self._run_inference_step()
-                    self.msleep(33 if self._capture is not None else 500)
+                    if self._capture is None:
+                        self.msleep(500)
+                    else:
+                        # Yield just enough to keep the event loop breathing without
+                        # adding artificial latency on top of real inference time.
+                        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+                        self.msleep(max(1, 10 - elapsed_ms))
                 except Exception as exc:  # pragma: no cover - defensive scaffold
                     self.log_message.emit(f"Inference error: {exc}")
                     self.frozen.emit()

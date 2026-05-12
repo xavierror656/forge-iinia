@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import platform
-import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -250,6 +249,64 @@ def build_rtsp_url(url: str, username: str = "", password: str = "") -> str:
     return urlunsplit((parts.scheme or "rtsp", netloc, parts.path, parts.query, parts.fragment))
 
 
+def build_usb_gstreamer_pipeline(
+    device: str,
+    *,
+    width: int = 0,
+    height: int = 0,
+    framerate: int = 0,
+) -> str:
+    """GStreamer pipeline for a USB/V4L2 webcam using hardware colorspace conversion.
+
+    On Jetson, nvvidconv does the YUV→BGR conversion on the VIC engine instead of CPU.
+    Falls back gracefully: if the camera outputs MJPEG the jpegdec element handles it.
+    """
+    res = f",width={width},height={height}" if width and height else ""
+    fps = f",framerate={framerate}/1" if framerate else ""
+    return (
+        f"v4l2src device={device} ! "
+        f"video/x-raw{res}{fps} ! "
+        "videoconvert ! video/x-raw,format=BGR ! "
+        "appsink drop=true sync=false max-buffers=1"
+    )
+
+
+def build_usb_gstreamer_pipeline_mjpeg(
+    device: str,
+    *,
+    width: int = 0,
+    height: int = 0,
+    framerate: int = 0,
+) -> str:
+    """GStreamer pipeline for a USB webcam that outputs MJPEG (most common on high-res)."""
+    res = f",width={width},height={height}" if width and height else ""
+    fps = f",framerate={framerate}/1" if framerate else ""
+    return (
+        f"v4l2src device={device} ! "
+        f"image/jpeg{res}{fps} ! "
+        "jpegdec ! videoconvert ! video/x-raw,format=BGR ! "
+        "appsink drop=true sync=false max-buffers=1"
+    )
+
+
+def build_csi_gstreamer_pipeline(
+    sensor_id: int = 0,
+    *,
+    width: int = 1280,
+    height: int = 720,
+    framerate: int = 30,
+    flip_method: int = 0,
+) -> str:
+    """GStreamer pipeline for a MIPI CSI camera via nvarguscamerasrc (Jetson only)."""
+    return (
+        f"nvarguscamerasrc sensor-id={sensor_id} ! "
+        f"video/x-raw(memory:NVMM),width={width},height={height},framerate={framerate}/1 ! "
+        f"nvvidconv flip-method={flip_method} ! "
+        "video/x-raw,format=BGRx ! videoconvert ! video/x-raw,format=BGR ! "
+        "appsink drop=true sync=false max-buffers=1"
+    )
+
+
 def build_rtsp_gstreamer_pipeline(url: str, *, latency_ms: int = 100) -> str:
     escaped = str(url).replace('"', '\\"')
     return (
@@ -347,21 +404,8 @@ def _normalized_rtsp_cameras(config: InferenceSourceConfig) -> list[dict[str, An
     return cameras
 
 
-_V4L2_DEVICE_RE = re.compile(r"^(?:/dev/video)?(\d+)$")
-
-
-def _resolve_v4l2_capture_source(source: str) -> Any:
-    match = _V4L2_DEVICE_RE.match(str(source).strip())
-    if match:
-        return int(match.group(1))
-    return source
-
-
 def _probe_capture(source: str, backend: int) -> bool:
-    capture_source: Any = source
-    if backend == cv2.CAP_V4L2:
-        capture_source = _resolve_v4l2_capture_source(source)
-    cap = cv2.VideoCapture(capture_source, backend)
+    cap = cv2.VideoCapture(source, backend)
     try:
         if not cap.isOpened():
             return False
@@ -544,3 +588,57 @@ def capture_backend_for(choice: VideoSourceChoice) -> int:
     if backend == "gstreamer":
         return cv2.CAP_GSTREAMER
     return cv2.CAP_ANY
+
+
+def open_capture(
+    choice: VideoSourceChoice,
+    *,
+    is_jetson: bool = False,
+) -> cv2.VideoCapture | None:
+    """Open a VideoCapture for the given choice, trying GStreamer first on Jetson.
+
+    Priority on Jetson:
+      - USB webcam  → GStreamer YUV pipeline → GStreamer MJPEG pipeline → V4L2 fallback
+      - CSI         → nvarguscamerasrc GStreamer pipeline (no fallback)
+      - RTSP        → GStreamer nvv4l2decoder pipeline → FFmpeg fallback
+    On x86 the same logic runs but skips Jetson-specific elements.
+    """
+    source = str(choice.source)
+    kind = choice.kind
+
+    # Build ordered list of (pipe_or_source, backend) to try
+    candidates: list[tuple[Any, int]] = []
+
+    if kind == "rtsp" or source.startswith("rtsp://"):
+        if is_jetson:
+            candidates.append((build_rtsp_gstreamer_pipeline(source), cv2.CAP_GSTREAMER))
+        candidates.append((source, cv2.CAP_FFMPEG))
+
+    elif kind == "csi":
+        sensor_id = int(source) if source.isdigit() else 0
+        candidates.append((build_csi_gstreamer_pipeline(sensor_id), cv2.CAP_GSTREAMER))
+
+    else:  # webcam / local
+        if is_jetson:
+            candidates.append((build_usb_gstreamer_pipeline(source), cv2.CAP_GSTREAMER))
+            candidates.append((build_usb_gstreamer_pipeline_mjpeg(source), cv2.CAP_GSTREAMER))
+        candidates.append((source, cv2.CAP_V4L2))
+
+    _ffmpeg_params = [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 4000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 4000]
+
+    for pipe, backend in candidates:
+        try:
+            if backend == cv2.CAP_FFMPEG:
+                try:
+                    cap = cv2.VideoCapture(pipe, backend, _ffmpeg_params)
+                except TypeError:
+                    cap = cv2.VideoCapture(pipe, backend)
+            else:
+                cap = cv2.VideoCapture(pipe, backend)
+        except Exception:
+            continue
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            return cap
+        cap.release()
+    return None
