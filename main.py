@@ -16,6 +16,7 @@ import queue
 import time
 import urllib.parse
 import torch
+import threading
 from threading import Lock
 from dataclasses import replace
 from pathlib import Path
@@ -156,6 +157,11 @@ class InferenceWorker(QThread):
         self._ui_min_interval: float = 1.0 / _UI_FPS
         self._pending_model_signature: tuple[float, int] | None = None
         self._telemetry = TelemetryCollector(hardware)
+        # Async frame reader — decouples camera I/O from inference loop
+        self._frame_lock = Lock()
+        self._latest_frame: Any = None
+        self._reader_stop: threading.Event | None = None
+        self._reader_thread: threading.Thread | None = None
 
     @property
     def camera_id(self) -> str:
@@ -359,6 +365,8 @@ class InferenceWorker(QThread):
             self._source_status = (
                 f"{chosen.kind.upper()} · {chosen.label}" if chosen else "Esperando stream..."
             )
+            if capture is not None:
+                self._start_reader()
             self._emit_source_state(
                 chosen, active=bool(capture), discovered=self._discovered_sources
             )
@@ -390,13 +398,45 @@ class InferenceWorker(QThread):
         self._active_choice = chosen
         self._read_failures = 0
         self._source_status = f"{chosen.kind.upper()} · {chosen.label}" if chosen else "Esperando stream..."
+        if capture is not None:
+            self._start_reader()
         emitted = self._emit_source_state(chosen, active=bool(capture), discovered=self._discovered_sources)
         if emitted and chosen:
             self.log_message.emit(f"Video source opened: {chosen.label}")
         elif emitted and candidates:
             self.log_message.emit("Video source unavailable, using simulated preview.")
 
+    def _start_reader(self) -> None:
+        """Start a background thread that continuously reads frames into a 1-slot buffer."""
+        self._reader_stop = threading.Event()
+        cap_ref = self._capture
+
+        def _reader() -> None:
+            assert self._reader_stop is not None
+            while not self._reader_stop.is_set() and cap_ref is not None:
+                ok, frame = cap_ref.read()
+                if ok and frame is not None:
+                    with self._frame_lock:
+                        self._latest_frame = frame
+                        self._telemetry.record_capture()
+
+        self._reader_thread = threading.Thread(
+            target=_reader, daemon=True, name="frame-reader"
+        )
+        self._reader_thread.start()
+
+    def _stop_reader(self) -> None:
+        if self._reader_stop is not None:
+            self._reader_stop.set()
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=1.0)
+        self._reader_stop = None
+        self._reader_thread = None
+        with self._frame_lock:
+            self._latest_frame = None
+
     def _release_capture(self) -> None:
+        self._stop_reader()
         if self._capture is not None:
             self._capture.release()
         self._capture = None
@@ -508,21 +548,23 @@ class InferenceWorker(QThread):
         simulation = self._capture is None
 
         if self._capture is not None:
-            ok, frame = self._capture.read()
-            if ok and frame is not None:
+            with self._frame_lock:
+                frame = self._latest_frame
+            if frame is not None:
                 raw_frame = frame
                 frame_size = (int(frame.shape[1]), int(frame.shape[0]))
                 self._read_failures = 0
                 simulation = False
-                self._telemetry.record_capture()
             else:
-                self._read_failures += 1
-                if self._read_failures >= 3:
-                    self.log_message.emit("Video source lost. Retrying...")
-                    self._release_capture()
-                    self._read_failures = 0
-                    self._source_status = "Esperando stream..."
-                    self._emit_source_state(None, active=False, discovered=self._discovered_sources)
+                # Reader thread hasn't delivered a frame yet (startup) or stream lost
+                if self._reader_thread is not None and not self._reader_thread.is_alive():
+                    self._read_failures += 1
+                    if self._read_failures >= 3:
+                        self.log_message.emit("Video source lost. Retrying...")
+                        self._release_capture()
+                        self._read_failures = 0
+                        self._source_status = "Esperando stream..."
+                        self._emit_source_state(None, active=False, discovered=self._discovered_sources)
                 simulation = True
 
         if raw_frame is None and simulation:

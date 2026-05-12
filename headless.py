@@ -2,10 +2,16 @@
 
 Uso:
     uv run python headless.py
-    uv run python headless.py --env .env.local
+    uv run python headless.py --preview --print-detections
     uv run python headless.py --model models/forge_project_5.pt --conf 0.25 --imgsz 640
-    uv run python headless.py --print-detections
-    uv run python headless.py --print-detections --detections-format json
+    uv run python headless.py --export-trt          # exporta el modelo a TensorRT y sale
+    uv run python headless.py --export-trt --int8   # INT8 (mayor throughput, requiere calibración)
+
+Arquitectura:
+    CaptureWorker  × N  →  frames en buffer 1-slot con backoff automático
+    BatchInferenceWorker    →  model.predict([f0, f1, …]) en una sola llamada GPU
+    GPIOWorker              →  despacha eventos GPIO
+    Watchdog                →  reinicia BatchInferenceWorker si se congela
 """
 
 from __future__ import annotations
@@ -13,9 +19,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import queue
 import signal
-import os
 import sys
 import threading
 import time
@@ -27,19 +33,20 @@ os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")  # must be set before cv2 imp
 import cv2
 import torch
 
-cv2.setLogLevel(3)  # also silence at runtime (belt-and-suspenders)
+cv2.setLogLevel(3)  # silence V4L2 backend probe warnings
 
-from core.config_store import load_gpio_assignments, get_last_project_id
+from core.capture_worker import CaptureWorker
+from core.config_store import get_last_project_id, load_gpio_assignments
 from core.gpio_backend import select_backend
 from core.gpio_dispatch import GPIODispatcher
 from core.hardware_manager import HardwareManager
 from core.logging_config import configure as configure_logging
+from core.model_manager import export_tensorrt, load_model
 from core.output_adapters import InferenceOutputDispatcher, inference_payload_from_frame
 from core.settings import Settings
 from core.video_source import (
     VIDEO_SOURCE_PATH,
     load_inference_source_config,
-    open_capture,
     resolve_video_source_candidates,
 )
 
@@ -73,7 +80,7 @@ class GPIOWorker(threading.Thread):
             self._dispatcher.set_assignments(assignments)
 
     def run(self) -> None:
-        log.info("GPIO worker started (backend=%s, sim=%s)", self._backend.name, self._simulation)
+        log.info("GPIO worker iniciado (backend=%s, sim=%s)", self._backend.name, self._simulation)
         while not self._stop_event.is_set():
             try:
                 label, camera_id, active = self._events.get(timeout=0.25)
@@ -92,11 +99,14 @@ class GPIOWorker(threading.Thread):
                 driven = self._backend.pulse(port, self._pulse_seconds)
                 outcome = "ok" if driven else "no-driver"
                 if self._simulation:
-                    log.info("[SIM] GPIO %s -> %s on %s%s", label, active, port, cam_tag)
+                    log.info("[SIM] GPIO %s → %s on %s%s", label, active, port, cam_tag)
                 else:
-                    log.info("GPIO %s -> %s on %s via %s (%s)%s", label, active, port, self._backend.name, outcome, cam_tag)
+                    log.info(
+                        "GPIO %s → %s on %s via %s (%s)%s",
+                        label, active, port, self._backend.name, outcome, cam_tag,
+                    )
             elif not port:
-                log.debug("GPIO event %s -> %s — sin puerto asignado%s", label, active, cam_tag)
+                log.debug("GPIO %s → %s — sin puerto%s", label, active, cam_tag)
 
 
 # ---------------------------------------------------------------------------
@@ -118,53 +128,46 @@ class Watchdog(threading.Thread):
         while not self._stop_event.wait(timeout=0.5):
             age = time.monotonic() - self._get_heartbeat()
             if age > self._timeout_s:
-                log.warning("Watchdog: inference freeze detected (%.1fs). Reiniciando...", age)
+                log.warning("Watchdog: freeze detectado (%.1fs). Reiniciando...", age)
                 self._on_freeze()
                 return
 
 
 # ---------------------------------------------------------------------------
-# Inference worker thread
+# Batch inference worker
 # ---------------------------------------------------------------------------
 
-class InferenceWorker(threading.Thread):
+class BatchInferenceWorker(threading.Thread):
+    """Runs model.predict() on all camera frames in a single batched call."""
+
     def __init__(
         self,
         *,
-        model_path: Path,
-        settings: Settings,
-        hardware: HardwareManager,
+        model: Any,
+        capture_workers: list[CaptureWorker],
         gpio_worker: GPIOWorker,
         output_dispatcher: InferenceOutputDispatcher,
         conf: float,
         imgsz: int,
-        camera_id: str = "0",
-        video_source: Any = None,
         print_detections: bool = False,
         detections_format: str = "human",
-        preview_queue: "queue.Queue[Any] | None" = None,
-        preloaded_model: Any = None,
+        preview_queues: dict[str, "queue.Queue[Any]"] | None = None,
     ) -> None:
-        super().__init__(name=f"inference-{camera_id}", daemon=True)
-        self._model_path = model_path
-        self._settings = settings
-        self._hardware = hardware
+        super().__init__(name="batch-inference", daemon=True)
+        self._model = model
+        self._captures = capture_workers
         self._gpio = gpio_worker
         self._output = output_dispatcher
         self._conf = conf
         self._imgsz = imgsz
-        self._camera_id = camera_id
-        self._video_source = video_source
         self._print_detections = print_detections
         self._detections_format = detections_format
-        self._preview_queue = preview_queue
+        self._preview_queues: dict[str, queue.Queue[Any]] = preview_queues or {}
+        self._device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self._stop_event = threading.Event()
         self._heartbeat = time.monotonic()
-        self._model: Any = preloaded_model
-        self._capture: cv2.VideoCapture | None = None
-        self._device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        self._read_failures = 0
-        self._active_states: dict[str, bool] = {}
+        # Per-camera active label state for GPIO edge detection
+        self._active_states: dict[str, dict[str, bool]] = {}
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -172,87 +175,9 @@ class InferenceWorker(threading.Thread):
     def heartbeat(self) -> float:
         return self._heartbeat
 
-    # -- model -----------------------------------------------------------------
+    # -- helpers ---------------------------------------------------------------
 
-    def _load_model(self) -> None:
-        if self._model is not None:
-            return  # already provided by caller
-        if not self._model_path.exists():
-            log.error("Modelo no encontrado: %s", self._model_path)
-            return
-        try:
-            from ultralytics import YOLO
-            self._model = YOLO(str(self._model_path))
-            self._model.to(self._device)
-            log.info("Modelo cargado: %s (device=%s, FP32)", self._model_path.name, self._device)
-        except Exception as exc:
-            log.error("Error cargando modelo: %s", exc)
-            self._model = None
-
-    # -- capture ---------------------------------------------------------------
-
-    def _open_capture(self) -> cv2.VideoCapture | None:
-        if self._video_source is None:
-            return None
-        cap = open_capture(self._video_source, is_jetson=self._hardware.info.kind == "jetson")
-        if cap is not None:
-            log.info("Fuente de video abierta: %s (%s)", self._video_source.label, self._video_source.source)
-        return cap
-
-    # -- preview ---------------------------------------------------------------
-
-    def _draw_boxes(self, frame: Any, detections: list[dict]) -> Any:
-        out = frame.copy()
-        for d in detections:
-            x1, y1, x2, y2 = (int(v) for v in d["bbox"])
-            label = f"{d['label']} {d['confidence']:.0%}"
-            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-            cv2.rectangle(out, (x1, y1 - th - 6), (x1 + tw + 4, y1), (0, 255, 0), -1)
-            cv2.putText(out, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
-        return out
-
-    # -- detection output ------------------------------------------------------
-
-    def _print_frame_detections(self, detections: list[dict]) -> None:
-        ts = time.strftime("%H:%M:%S")
-        if self._detections_format == "json":
-            record = {
-                "ts": ts,
-                "cam": self._camera_id,
-                "count": len(detections),
-                "detections": detections,
-            }
-            sys.stdout.write(json.dumps(record) + "\n")
-            sys.stdout.flush()
-        else:
-            if not detections:
-                return
-            labels = ", ".join(
-                f"{d['label']} ({d['confidence']:.0%})" for d in detections
-            )
-            sys.stdout.write(f"[{ts}][cam {self._camera_id}] {len(detections)} det — {labels}\n")
-            sys.stdout.flush()
-
-    # -- inference step --------------------------------------------------------
-
-    def _run_detections(self, frame: Any) -> list[dict]:
-        if self._model is None or frame is None:
-            return []
-        try:
-            results = self._model.predict(
-                frame,
-                verbose=False,
-                conf=self._conf,
-                imgsz=self._imgsz,
-                device=self._device,
-            )
-        except Exception as exc:
-            log.warning("Inferencia fallida: %s", exc)
-            return []
-        if not results:
-            return []
-        result = results[0]
+    def _parse_result(self, result: Any) -> list[dict]:
         boxes = getattr(result, "boxes", None)
         if boxes is None:
             return []
@@ -274,87 +199,119 @@ class InferenceWorker(threading.Thread):
             })
         return detections
 
-    def _dispatch_gpio(self, detections: list[dict]) -> None:
-        current_labels = {d["label"] for d in detections}
+    def _dispatch_gpio(self, detections: list[dict], cam_id: str) -> None:
+        states = self._active_states.setdefault(cam_id, {})
+        current = {d["label"] for d in detections}
         fired: set[str] = set()
         for d in detections:
-            label = d["label"]
-            if label not in fired:
-                fired.add(label)
-                if not self._active_states.get(label):
-                    self._active_states[label] = True
-                    self._gpio.enqueue(label, self._camera_id, True)
-        for label in list(self._active_states):
-            if self._active_states[label] and label not in current_labels:
-                self._active_states[label] = False
-                self._gpio.enqueue(label, self._camera_id, False)
+            lbl = d["label"]
+            if lbl not in fired:
+                fired.add(lbl)
+                if not states.get(lbl):
+                    states[lbl] = True
+                    self._gpio.enqueue(lbl, cam_id, True)
+        for lbl in list(states):
+            if states[lbl] and lbl not in current:
+                states[lbl] = False
+                self._gpio.enqueue(lbl, cam_id, False)
+
+    def _draw_boxes(self, frame: Any, detections: list[dict]) -> Any:
+        out = frame.copy()
+        for d in detections:
+            x1, y1, x2, y2 = (int(v) for v in d["bbox"])
+            label = f"{d['label']} {d['confidence']:.0%}"
+            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            cv2.rectangle(out, (x1, y1 - th - 6), (x1 + tw + 4, y1), (0, 255, 0), -1)
+            cv2.putText(out, label, (x1 + 2, y1 - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+        return out
+
+    def _print_frame_detections(self, detections: list[dict], cam_id: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        if self._detections_format == "json":
+            record = {"ts": ts, "cam": cam_id, "count": len(detections), "detections": detections}
+            sys.stdout.write(json.dumps(record) + "\n")
+            sys.stdout.flush()
+        else:
+            if not detections:
+                return
+            labels = ", ".join(f"{d['label']} ({d['confidence']:.0%})" for d in detections)
+            sys.stdout.write(f"[{ts}][cam {cam_id}] {len(detections)} det — {labels}\n")
+            sys.stdout.flush()
+
+    # -- main loop -------------------------------------------------------------
 
     def _step(self) -> None:
         self._heartbeat = time.monotonic()
 
-        if self._capture is None:
-            self._capture = self._open_capture()
-            if self._capture is None:
-                log.debug("Sin fuente de video disponible, reintentando...")
-                time.sleep(2.0)
-                return
+        # Collect latest frames from all cameras that have one ready
+        batch_frames: list[Any] = []
+        batch_ids: list[str] = []
+        for cw in self._captures:
+            frame = cw.latest_frame()
+            if frame is not None:
+                batch_frames.append(frame)
+                batch_ids.append(cw.camera_id)
 
-        ok, frame = self._capture.read()
-        if not ok or frame is None:
-            self._read_failures += 1
-            if self._read_failures >= 3:
-                log.warning("Fuente de video perdida, reintentando...")
-                self._capture.release()
-                self._capture = None
-                self._read_failures = 0
+        if not batch_frames:
+            time.sleep(0.005)
             return
-        self._read_failures = 0
 
-        detections = self._run_detections(frame)
-        self._dispatch_gpio(detections)
+        # Single batched GPU call for all cameras
+        try:
+            results = self._model.predict(
+                batch_frames,
+                verbose=False,
+                conf=self._conf,
+                imgsz=self._imgsz,
+                device=self._device,
+            )
+        except Exception as exc:
+            log.warning("Batch inference fallida: %s", exc)
+            return
 
-        h, w = frame.shape[:2]
-        payload = inference_payload_from_frame(
-            {
-                "detections": detections,
-                "source": "",
-                "source_label": "",
-                "simulation": False,
-                "frame_size": (w, h),
-            },
-            camera_id=self._camera_id,
-        )
-        self._output.publish(payload)
+        for result, cam_id, frame in zip(results, batch_ids, batch_frames):
+            detections = self._parse_result(result)
 
-        if self._preview_queue is not None:
-            annotated = self._draw_boxes(frame, detections)
-            try:
-                self._preview_queue.put_nowait((self._camera_id, annotated))
-            except queue.Full:
-                pass
+            self._dispatch_gpio(detections, cam_id)
 
-        if self._print_detections:
-            self._print_frame_detections(detections)
-        elif detections:
-            labels_str = ", ".join(f"{d['label']} {d['confidence']:.2f}" for d in detections[:5])
-            log.debug("[cam %s] %d detecciones: %s", self._camera_id, len(detections), labels_str)
+            h, w = frame.shape[:2]
+            payload = inference_payload_from_frame(
+                {
+                    "detections": detections,
+                    "source": "",
+                    "source_label": "",
+                    "simulation": False,
+                    "frame_size": (w, h),
+                },
+                camera_id=cam_id,
+            )
+            self._output.publish(payload)
 
-    # -- thread loop -----------------------------------------------------------
+            if cam_id in self._preview_queues:
+                annotated = self._draw_boxes(frame, detections)
+                try:
+                    self._preview_queues[cam_id].put_nowait((cam_id, annotated))
+                except queue.Full:
+                    pass
+
+            if self._print_detections:
+                self._print_frame_detections(detections, cam_id)
 
     def run(self) -> None:
-        self._heartbeat = time.monotonic()  # reset so watchdog doesn't fire during model load
-        self._load_model()
-        self._heartbeat = time.monotonic()  # reset again after load; inference loop starts now
-        log.info("Worker de inferencia iniciado (cam=%s, conf=%.2f, imgsz=%d)", self._camera_id, self._conf, self._imgsz)
+        self._heartbeat = time.monotonic()
+        log.info(
+            "Batch inference iniciado — %d cámara(s), conf=%.2f, imgsz=%d, device=%s",
+            len(self._captures), self._conf, self._imgsz, self._device,
+        )
         while not self._stop_event.is_set():
             try:
                 self._step()
             except Exception as exc:
-                log.error("Error en step de inferencia: %s", exc, exc_info=True)
+                log.error("Error en batch step: %s", exc, exc_info=True)
                 time.sleep(0.5)
-        if self._capture is not None:
-            self._capture.release()
-        log.info("Worker de inferencia detenido (cam=%s)", self._camera_id)
+        log.info("Batch inference detenido")
 
 
 # ---------------------------------------------------------------------------
@@ -372,29 +329,36 @@ def _find_model(settings: Settings) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="EdgeVision headless inference runner")
-    parser.add_argument("--env", default=".env", help="Ruta al archivo .env (default: .env)")
+    parser.add_argument("--env", default=".env")
     parser.add_argument("--model", default="", help="Ruta al modelo (override del .env)")
-    parser.add_argument("--conf", type=float, default=0.25, help="Umbral de confianza (default: 0.25)")
-    parser.add_argument("--imgsz", type=int, default=640, help="Tamaño de imagen para inferencia (default: 640)")
-    parser.add_argument("--watchdog-timeout", type=float, default=0.0, help="Watchdog timeout en segundos (0 = usar valor del .env)")
-    parser.add_argument("--preview", action="store_true", help="Muestra preview con bounding boxes via OpenCV (requiere display)")
-    parser.add_argument("--print-detections", action="store_true", help="Imprime detecciones a stdout en tiempo real")
-    parser.add_argument("--detections-format", default="human", choices=["human", "json"], help="Formato de salida de detecciones (default: human)")
-    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--watchdog-timeout", type=float, default=0.0,
+                        help="Watchdog timeout en segundos (0 = usar valor del .env)")
+    parser.add_argument("--preview", action="store_true",
+                        help="Muestra preview con bounding boxes via OpenCV (requiere display)")
+    parser.add_argument("--print-detections", action="store_true",
+                        help="Imprime detecciones a stdout en tiempo real")
+    parser.add_argument("--detections-format", default="human", choices=["human", "json"])
+    parser.add_argument("--export-trt", action="store_true",
+                        help="Exporta el modelo a TensorRT .engine y sale")
+    parser.add_argument("--half", action="store_true", default=True,
+                        help="FP16 para export TensorRT (default: True)")
+    parser.add_argument("--int8", action="store_true",
+                        help="INT8 para export TensorRT (mayor throughput)")
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
     settings = Settings.load(args.env)
     configure_logging(log_dir=settings.log_dir or None, level=args.log_level)
 
-    problems = settings.validate()
-    if problems:
-        for p in problems:
-            log.warning("Config: %s", p)
+    for p in settings.validate():
+        log.warning("Config: %s", p)
 
-    forced = settings.hardware_override or None
     if settings.simulation_mode:
         hardware = HardwareManager(force_simulation=True)
-    elif forced:
+    elif (forced := settings.hardware_override or None):
         hardware = HardwareManager(forced_kind=forced)
     else:
         hardware = HardwareManager()
@@ -403,19 +367,28 @@ def main() -> None:
     model_path = Path(args.model) if args.model else _find_model(settings)
     log.info("Modelo: %s", model_path)
 
-    # Load model once in main thread — avoids 4 simultaneous loads blocking the GIL
-    preloaded_model: Any = None
-    if model_path.exists():
+    # TensorRT export mode — export and exit
+    if args.export_trt:
         try:
-            from ultralytics import YOLO
-            _device = "cuda:0" if torch.cuda.is_available() else "cpu"
-            preloaded_model = YOLO(str(model_path))
-            preloaded_model.to(_device)
-            log.info("Modelo cargado: %s (device=%s, FP32)", model_path.name, _device)
+            engine_path = export_tensorrt(
+                model_path,
+                half=args.half,
+                int8=args.int8,
+                imgsz=args.imgsz,
+            )
+            print(f"Engine listo: {engine_path}")
         except Exception as exc:
-            log.error("Error cargando modelo: %s", exc)
-    else:
-        log.error("Modelo no encontrado: %s", model_path)
+            log.error("Export fallido: %s", exc)
+            sys.exit(1)
+        return
+
+    # Load model once in main thread — all workers share the same instance
+    try:
+        _device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        preloaded_model = load_model(model_path, device=_device)
+    except Exception as exc:
+        log.error("Error cargando modelo: %s", exc)
+        preloaded_model = None
 
     output_dispatcher = InferenceOutputDispatcher(
         settings.output_config,
@@ -427,7 +400,6 @@ def main() -> None:
 
     gpio_worker = GPIOWorker(hardware, settings)
 
-    # Load GPIO assignments for the last active project
     try:
         all_assignments = load_gpio_assignments()
         project_id = get_last_project_id()
@@ -435,111 +407,104 @@ def main() -> None:
         if project_id is not None:
             gpio_assignments = all_assignments.get(str(project_id), {})
         if not gpio_assignments and all_assignments:
-            # Fallback: use first available project
             gpio_assignments = next(iter(all_assignments.values()), {})
         if gpio_assignments:
             gpio_worker.set_assignments(gpio_assignments)
-            log.info("GPIO assignments cargados: %d labels (proyecto %s)", len(gpio_assignments), project_id)
+            log.info("GPIO: %d labels (proyecto %s)", len(gpio_assignments), project_id)
         else:
-            log.info("Sin GPIO assignments configurados")
+            log.info("GPIO: sin assignments configurados")
     except Exception as exc:
-        log.debug("No se pudieron cargar GPIO assignments: %s", exc)
+        log.debug("GPIO assignments no disponibles: %s", exc)
 
-    # Resolve camera candidates once — each worker gets its own pre-resolved source.
-    # Filter to available=True only: resolve_video_source_candidates appends unavailable
-    # discovered devices (/dev/videoN control nodes) as fallback, which we don't want.
+    # Resolve camera candidates once — filter to available capture devices only
     source_cfg = load_inference_source_config(VIDEO_SOURCE_PATH)
     try:
         all_candidates, _ = resolve_video_source_candidates(source_cfg, hardware)
-        candidates = [c for c in all_candidates if c.available]
-        if not candidates:
-            candidates = all_candidates  # last resort: use all if none marked available
+        candidates = [c for c in all_candidates if c.available] or all_candidates
     except Exception:
         candidates = []
 
     if candidates:
-        log.info("Fuentes de video: %s", [c.source for c in candidates])
+        log.info("Cámaras: %s", [c.source for c in candidates])
     else:
-        log.warning("Sin fuentes de video configuradas — arrancando sin cámara")
+        log.warning("Sin fuentes de video — solo GPIO/protocolos activos")
 
-    # One preview queue per worker (maxsize=1 so main thread always gets latest frame)
-    preview_queues: list["queue.Queue[Any]"] = (
-        [queue.Queue(maxsize=1) for _ in candidates] if args.preview else []
+    is_jetson = hardware.info.kind == "jetson"
+
+    # One CaptureWorker per camera — async frame buffer with backoff reconnection
+    capture_workers = [
+        CaptureWorker(src, is_jetson=is_jetson, camera_id=str(idx))
+        for idx, src in enumerate(candidates)
+    ]
+
+    # Per-camera preview queues (maxsize=1 → main thread always gets latest frame)
+    preview_queues: dict[str, queue.Queue[Any]] = (
+        {str(idx): queue.Queue(maxsize=1) for idx in range(len(capture_workers))}
+        if args.preview and capture_workers else {}
     )
 
-    watchdog_timeout = args.watchdog_timeout if args.watchdog_timeout > 0 else settings.watchdog_timeout_seconds
+    watchdog_timeout = (
+        args.watchdog_timeout if args.watchdog_timeout > 0
+        else settings.watchdog_timeout_seconds
+    )
 
-    workers: list[InferenceWorker] = []
-
-    def _make_worker(idx: int, source: Any) -> InferenceWorker:
-        pq = preview_queues[idx] if preview_queues else None
-        return InferenceWorker(
-            model_path=model_path,
-            settings=settings,
-            hardware=hardware,
+    def _make_batch_worker() -> BatchInferenceWorker:
+        return BatchInferenceWorker(
+            model=preloaded_model,
+            capture_workers=capture_workers,
             gpio_worker=gpio_worker,
             output_dispatcher=output_dispatcher,
             conf=args.conf,
             imgsz=args.imgsz,
-            camera_id=str(idx),
-            video_source=source,
             print_detections=args.print_detections,
             detections_format=args.detections_format,
-            preview_queue=pq,
-            preloaded_model=preloaded_model,
+            preview_queues=preview_queues,
         )
 
-    for idx, src in enumerate(candidates or [None]):
-        workers.append(_make_worker(idx, src))
+    batch_worker = _make_batch_worker()
 
-    watchdogs: list[Watchdog] = []
-    for w in workers:
-        def make_on_freeze(worker: InferenceWorker, widx: int) -> Any:
-            def on_freeze() -> None:
-                log.warning("Reiniciando worker %s...", worker.name)
-                worker.stop()
-                worker.join(timeout=3.0)
-                new_w = _make_worker(widx, worker._video_source)
-                new_w.start()
-                workers[widx] = new_w
-            return on_freeze
+    def on_freeze() -> None:
+        nonlocal batch_worker
+        log.warning("Reiniciando batch inference worker...")
+        batch_worker.stop()
+        batch_worker.join(timeout=3.0)
+        batch_worker = _make_batch_worker()
+        batch_worker.start()
 
-        wd = Watchdog(
-            get_heartbeat=w.heartbeat,
-            timeout_s=watchdog_timeout,
-            on_freeze=make_on_freeze(w, workers.index(w)),
-        )
-        watchdogs.append(wd)
+    watchdog = Watchdog(
+        get_heartbeat=batch_worker.heartbeat,
+        timeout_s=watchdog_timeout,
+        on_freeze=on_freeze,
+    )
 
-    # Shutdown handler
     stop_event = threading.Event()
 
     def shutdown(signum: int, frame: Any) -> None:
-        log.info("Señal %d recibida — deteniendo...", signum)
+        log.info("Señal %d — deteniendo...", signum)
         stop_event.set()
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    # Start everything
+    # Start all workers
     gpio_worker.start()
-    for w in workers:
-        w.start()
-    for wd in watchdogs:
-        wd.start()
+    for cw in capture_workers:
+        cw.start()
+    batch_worker.start()
+    watchdog.start()
 
     log.info(
         "EdgeVision headless iniciado — %d cámara(s), modelo=%s, conf=%.2f, imgsz=%d",
-        len(workers), model_path.name, args.conf, args.imgsz,
+        len(capture_workers), model_path.name, args.conf, args.imgsz,
     )
 
-    # Preview loop runs in main thread (cv2.imshow is not thread-safe with Qt backend)
+    # Preview loop must run in main thread (cv2.imshow is not thread-safe with Qt backend)
     if args.preview and preview_queues:
         while not stop_event.is_set():
-            for idx, pq in enumerate(preview_queues):
+            for cam_id, pq in preview_queues.items():
                 try:
-                    cam_id, frame = pq.get_nowait()
-                    cv2.imshow(f"Cam {cam_id}", frame)
+                    cid, frame = pq.get_nowait()
+                    cv2.imshow(f"Cam {cid}", frame)
                 except queue.Empty:
                     pass
             key = cv2.waitKey(1) & 0xFF
@@ -550,15 +515,16 @@ def main() -> None:
     else:
         stop_event.wait()
 
-    log.info("Deteniendo workers...")
-    for wd in watchdogs:
-        wd.stop()
-    for w in workers:
-        w.stop()
+    log.info("Deteniendo...")
+    watchdog.stop()
+    batch_worker.stop()
+    for cw in capture_workers:
+        cw.stop()
     gpio_worker.stop()
 
-    for w in workers:
-        w.join(timeout=5.0)
+    batch_worker.join(timeout=5.0)
+    for cw in capture_workers:
+        cw.join(timeout=3.0)
     gpio_worker.join(timeout=3.0)
 
     output_dispatcher.stop()
