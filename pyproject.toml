@@ -14,6 +14,7 @@ dependencies = [
     "torch>=2.0",
     "torchvision>=0.15",
     "paho-mqtt>=2.1.0",
+    "nodegraphqt>=0.6.44",
 ]
 
 [project.optional-dependencies]

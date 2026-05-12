@@ -7,7 +7,7 @@ import base64
 import json
 from pathlib import Path
 
-from PyQt6.QtCore import QMimeData, QPoint, QRect, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QMetaObject, QMimeData, QPoint, QRect, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QDrag, QFont, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -41,6 +41,7 @@ from PyQt6.QtWidgets import (
 
 
 from core.config_store import UI_STATE_PATH  # re-exported for compatibility
+from ui.forge_graph import ForgeGraphWidget
 from ui.icons import icon as _icon
 
 
@@ -110,15 +111,18 @@ class IconChip(QWidget):
         icon_name: str,
         *,
         icon_color: str = "primary",
-        bg_color: str = "#1b2028",
-        fg_color: str = "#cfd6e1",
+        bg_color: str | None = None,
+        fg_color: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._icon_name = icon_name
         self._icon_color = icon_color
-        self._bg_color = bg_color
-        self._fg_color = fg_color
+        self._theme = "dark"
+        from ui.theme import tokens as _t
+        t = _t("dark")
+        self._bg_color = bg_color or t["surface2"]
+        self._fg_color = fg_color or t["muted"]
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 4, 10, 4)
@@ -160,6 +164,14 @@ class IconChip(QWidget):
         )
         self.setStyleSheet(f"background: {self._bg_color}; border-radius: 12px;")
 
+    def set_theme(self, theme: str) -> None:
+        from ui.theme import tokens as _t
+        t = _t(theme)
+        self._theme = theme
+        self._bg_color = t["surface2"]
+        self._fg_color = t["muted"]
+        self.set_content(self._text_label.text())
+
 
 class ColorChipDelegate(QStyledItemDelegate):
     """Paints a colored dot next to the label text instead of using item background."""
@@ -171,17 +183,26 @@ class ColorChipDelegate(QStyledItemDelegate):
         super().__init__(parent)
         self._header_font = QFont()
         self._header_font.setBold(True)
+        self._theme = "dark"
+
+    def set_theme(self, theme: str) -> None:
+        self._theme = theme
+
+    def _t(self) -> dict:
+        from ui.theme import tokens as _tok
+        return _tok(self._theme)
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # noqa: D401
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
+        t = self._t()
 
         is_header = bool(index.data(Qt.ItemDataRole.UserRole + 1))
         if is_header:
             painter.save()
-            painter.fillRect(option.rect, QColor("#0d1016"))
+            painter.fillRect(option.rect, QColor(t["bg"]))
             painter.setFont(self._header_font)
-            painter.setPen(QPen(QColor("#9fb2c8")))
+            painter.setPen(QPen(QColor(t["muted"])))
             x_offset = 10
             decoration = index.data(Qt.ItemDataRole.DecorationRole)
             if decoration is not None and hasattr(decoration, "pixmap"):
@@ -214,14 +235,14 @@ class ColorChipDelegate(QStyledItemDelegate):
         if color_hex:
             color = QColor(color_hex)
             if not color.isValid():
-                color = QColor("#7a8392")
+                color = QColor(t["muted"])
         else:
-            color = QColor("#3a4452")
+            color = QColor(t["hover"])
 
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setBrush(QBrush(color))
-        painter.setPen(QPen(QColor("#0a0c10"), 1))
+        painter.setPen(QPen(QColor(t["bg"]), 1))
         painter.drawEllipse(QPoint(cx, cy), self.DOT_RADIUS, self.DOT_RADIUS)
         painter.restore()
 
@@ -229,9 +250,9 @@ class ColorChipDelegate(QStyledItemDelegate):
         text_rect = rect.adjusted(self.DOT_PADDING * 2 + self.DOT_RADIUS, 0, -8, 0)
         painter.save()
         if option.state & QStyle.StateFlag.State_Selected:
-            painter.setPen(QPen(QColor("#ffffff")))
+            painter.setPen(QPen(QColor(t["surface"])))
         else:
-            painter.setPen(QPen(QColor("#e6eaf2")))
+            painter.setPen(QPen(QColor(t["text"])))
         painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), text)
         painter.restore()
 
@@ -264,9 +285,12 @@ class EmptyMessageMixin:
         super().paintEvent(event)
         if not self._empty_message or self._has_visible_items():
             return
+        from ui.theme import tokens as _tok
+        from PyQt6.QtWidgets import QApplication
+        _theme = (QApplication.instance().property("uiTheme") or "dark") if QApplication.instance() else "dark"
         painter = QPainter(self.viewport())
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor("#6c7680")))
+        painter.setPen(QPen(QColor(_tok(_theme)["muted2"])))
         font = painter.font()
         font.setItalic(True)
         font.setPointSizeF(max(9.0, font.pointSizeF()))
@@ -333,10 +357,14 @@ class DragListWidget(EmptyMessageMixin, QListWidget):
         pixmap.fill(QColor(0, 0, 0, 0))
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setBrush(QBrush(QColor("#243043")))
-        painter.setPen(QPen(QColor("#4d6b8a"), 1))
+        from ui.theme import tokens as _tok
+        from PyQt6.QtWidgets import QApplication
+        _theme = (QApplication.instance().property("uiTheme") or "dark") if QApplication.instance() else "dark"
+        _tc = _tok(_theme)
+        painter.setBrush(QBrush(QColor(_tc["hover"])))
+        painter.setPen(QPen(QColor(_tc["info"]), 1))
         painter.drawRoundedRect(0, 0, width - 1, 31, 8, 8)
-        painter.setPen(QPen(QColor("#e6eaf2")))
+        painter.setPen(QPen(QColor(_tc["text"])))
         painter.drawText(pixmap.rect(), int(Qt.AlignmentFlag.AlignCenter), text)
         painter.end()
         return pixmap
@@ -507,7 +535,7 @@ class CollapsibleSection(QWidget):
 class LabelPreviewCard(QFrame):
     clicked = pyqtSignal(dict)
 
-    def __init__(self, data: dict[str, object], parent: QWidget | None = None) -> None:
+    def __init__(self, data: dict[str, object], parent: QWidget | None = None, *, theme: str = "dark") -> None:
         super().__init__(parent)
         self._data = data
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -519,7 +547,6 @@ class LabelPreviewCard(QFrame):
         self.image = QLabel()
         self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image.setMinimumHeight(96)
-        self.image.setStyleSheet("background:#0f1115; border-radius:6px; color:#8b95a1;")
 
         crop = str(data.get("preview_base64", "")).strip()
         pixmap = QPixmap()
@@ -531,24 +558,137 @@ class LabelPreviewCard(QFrame):
         title_row = QHBoxLayout()
         title_row.setContentsMargins(0, 0, 0, 0)
         title_row.setSpacing(6)
-        color_dot = QLabel()
-        color_dot.setFixedSize(10, 10)
-        color = str(data.get("color", "")).strip() or "#3a4452"
-        color_dot.setStyleSheet(f"background:{color}; border-radius:5px; border:1px solid #0a0c10;")
+        self._color_dot = QLabel()
+        self._color_dot.setFixedSize(10, 10)
+        self._label_color = str(data.get("color", "")).strip() or "#3a4452"
         self.title = QLabel(str(data.get("name", "")))
         self.title.setStyleSheet("font-weight: 600;")
-        title_row.addWidget(color_dot)
+        title_row.addWidget(self._color_dot)
         title_row.addWidget(self.title, 1)
 
         self.subtitle = QLabel(str(data.get("type", "") or ""))
-        self.subtitle.setStyleSheet("color:#9fb2c8; font-size: 11px;")
         layout.addWidget(self.image)
         layout.addLayout(title_row)
         layout.addWidget(self.subtitle)
 
+        self.set_theme(theme)
+
+    def set_theme(self, theme: str) -> None:
+        from ui.theme import tokens as _tokens
+        t = _tokens(theme)
+        self.image.setStyleSheet(
+            f"background:{t['surface2']}; border-radius:6px; color:{t['muted']};"
+        )
+        self._color_dot.setStyleSheet(
+            f"background:{self._label_color}; border-radius:5px; border:1px solid {t['border']};"
+        )
+        self.subtitle.setStyleSheet(f"color:{t['muted']}; font-size:11px;")
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
         self.clicked.emit(self._data)
         super().mousePressEvent(event)
+
+
+class LabelGalleryStatsBar(QWidget):
+    """Compact statistics summary shown above the label gallery grid."""
+
+    _BAR_WIDTH = 18
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 6, 10, 8)
+        layout.setSpacing(3)
+
+        self._header = QLabel()
+        self._header.setStyleSheet("font-size:11px; font-weight:600;")
+        layout.addWidget(self._header)
+
+        self._cam_bar = QLabel()
+        self._cam_bar.setStyleSheet("font-size:10px; font-family:monospace;")
+        layout.addWidget(self._cam_bar)
+
+        self._gpio_bar = QLabel()
+        self._gpio_bar.setStyleSheet("font-size:10px; font-family:monospace;")
+        layout.addWidget(self._gpio_bar)
+
+        self._status_row = QLabel()
+        self._status_row.setStyleSheet("font-size:10px;")
+        self._status_row.setWordWrap(True)
+        layout.addWidget(self._status_row)
+
+        self._types_row = QLabel()
+        self._types_row.setStyleSheet("font-size:10px;")
+        self._types_row.setWordWrap(True)
+        layout.addWidget(self._types_row)
+
+        self.set_theme("dark")
+
+    def update_stats(
+        self,
+        items: list[dict],
+        camera_for_label: dict[str, list[str]],
+        gpio_for_label: dict[str, str],
+        visible_count: int | None = None,
+    ) -> None:
+        total = len(items)
+        if total == 0:
+            self.setVisible(False)
+            return
+
+        names = [str(item.get("name", "")) for item in items]
+        with_cam = sum(1 for n in names if camera_for_label.get(n))
+        with_gpio = sum(1 for n in names if gpio_for_label.get(n))
+        both = sum(1 for n in names if camera_for_label.get(n) and gpio_for_label.get(n))
+        partial = with_cam + with_gpio - 2 * both
+        none_ = total - with_cam - with_gpio + both
+
+        types: dict[str, int] = {}
+        for item in items:
+            t = str(item.get("type", "")).strip() or "—"
+            types[t] = types.get(t, 0) + 1
+
+        shown = f"  ·  {visible_count} visibles" if visible_count is not None and visible_count != total else ""
+        self._header.setText(f"{total} labels{shown}  ·  {len(types)} tipo{'s' if len(types) != 1 else ''}")
+
+        self._cam_bar.setText(self._bar("📷 cám ", with_cam, total))
+        self._gpio_bar.setText(self._bar("⚡ gpio", with_gpio, total))
+
+        status_parts = []
+        if both:
+            status_parts.append(f"✓ {both} completos")
+        if partial:
+            status_parts.append(f"◑ {partial} parciales")
+        if none_:
+            status_parts.append(f"○ {none_} sin asignar")
+        self._status_row.setText("  ·  ".join(status_parts))
+
+        sorted_types = sorted(types.items(), key=lambda kv: -kv[1])
+        type_parts = [f"{t} ({n})" for t, n in sorted_types[:7]]
+        if len(sorted_types) > 7:
+            type_parts.append(f"+{len(sorted_types) - 7} más")
+        self._types_row.setText("  ·  ".join(type_parts))
+
+        self.setVisible(True)
+
+    def set_theme(self, theme: str) -> None:
+        from ui.theme import tokens as _tokens
+        t = _tokens(theme)
+        self.setStyleSheet(
+            f"background:{t['surface2']}; border:1px solid {t['border']}; border-radius:6px;"
+        )
+        self._header.setStyleSheet(f"color:{t['muted']}; font-size:11px; font-weight:600;")
+        self._cam_bar.setStyleSheet(f"color:{t['info']}; font-size:10px; font-family:monospace;")
+        self._gpio_bar.setStyleSheet(f"color:{t['warning']}; font-size:10px; font-family:monospace;")
+        self._status_row.setStyleSheet(f"color:{t['muted2']}; font-size:10px;")
+        self._types_row.setStyleSheet(f"color:{t['muted2']}; font-size:10px;")
+
+    def _bar(self, label: str, value: int, total: int) -> str:
+        ratio = value / total if total else 0.0
+        filled = round(ratio * self._BAR_WIDTH)
+        empty = self._BAR_WIDTH - filled
+        pct = f"{ratio:.0%}"
+        return f"{label}  {'█' * filled}{'░' * empty}  {value}/{total} ({pct})"
 
 
 class LabelGalleryWidget(QWidget):
@@ -561,8 +701,18 @@ class LabelGalleryWidget(QWidget):
         self._items: list[dict[str, object]] = []
         self._cards: list[LabelPreviewCard] = []
         self._filter_text = ""
+        self._name_whitelist: set[str] | None = None
+        self._camera_for_label: dict[str, list[str]] = {}
+        self._gpio_for_label: dict[str, str] = {}
+        self._theme = "dark"
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self.stats_bar = LabelGalleryStatsBar()
+        layout.addWidget(self.stats_bar)
+
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.content = QWidget()
@@ -570,7 +720,7 @@ class LabelGalleryWidget(QWidget):
         self.grid.setSpacing(8)
         self.grid.setContentsMargins(4, 4, 4, 4)
         self.scroll.setWidget(self.content)
-        layout.addWidget(self.scroll)
+        layout.addWidget(self.scroll, 1)
 
     def set_items(self, items: list[dict]) -> None:
         self._items = list(items)
@@ -584,6 +734,21 @@ class LabelGalleryWidget(QWidget):
         self._name_whitelist = {n.lower() for n in names} if names is not None else None
         self.refresh()
 
+    def set_theme(self, theme: str) -> None:
+        self._theme = theme
+        self.stats_bar.set_theme(theme)
+        for card in self._cards:
+            card.set_theme(theme)
+
+    def set_assignment_context(
+        self,
+        camera_for_label: dict[str, list[str]],
+        gpio_for_label: dict[str, str],
+    ) -> None:
+        self._camera_for_label = camera_for_label
+        self._gpio_for_label = gpio_for_label
+        self._refresh_stats()
+
     def refresh(self) -> None:
         while self.grid.count():
             child = self.grid.takeAt(0)
@@ -592,18 +757,27 @@ class LabelGalleryWidget(QWidget):
         self._cards.clear()
         visible_items = [item for item in self._items if self._matches(item)]
         for index, item in enumerate(visible_items):
-            card = LabelPreviewCard(item)
+            card = LabelPreviewCard(item, theme=self._theme)
             card.clicked.connect(self.selected.emit)
             self._cards.append(card)
             self.grid.addWidget(card, index // self.COLUMNS, index % self.COLUMNS)
         if visible_items:
             self.selected.emit(visible_items[0])
+        self._refresh_stats(visible_count=len(visible_items))
+
+    def _refresh_stats(self, visible_count: int | None = None) -> None:
+        shown = visible_count if visible_count is not None else len(self._items)
+        self.stats_bar.update_stats(
+            self._items,
+            self._camera_for_label,
+            self._gpio_for_label,
+            visible_count=shown if shown != len(self._items) else None,
+        )
 
     def _matches(self, item: dict[str, object]) -> bool:
-        whitelist = getattr(self, "_name_whitelist", None)
-        if whitelist is not None:
+        if self._name_whitelist is not None:
             name = str(item.get("name", "")).lower()
-            if name and name not in whitelist:
+            if name and name not in self._name_whitelist:
                 return False
         if not self._filter_text:
             return True
@@ -630,6 +804,7 @@ class ForgePanel(QWidget):
     bulk_clear_requested = pyqtSignal(list)
     help_requested = pyqtSignal()
     download_model_requested = pyqtSignal(int)
+    graph_assignments_changed = pyqtSignal(dict, dict)
 
     FILTER_ALL = "all"
     FILTER_NO_CAMERA = "no_camera"
@@ -642,9 +817,16 @@ class ForgePanel(QWidget):
         self._label_source: list[str | dict] = []
         self._camera_for_label: dict[str, list[str]] = {}
         self._gpio_for_label: dict[str, str] = {}
+        self._label_for_camera: dict[str, set[str]] = {}
         self._filter_mode: str = self.FILTER_ALL
         self._group_mode: str = "none"
         self._current_orientation: Qt.Orientation | None = None
+        self.graph_view: ForgeGraphWidget | None = None
+        self._label_tab_index: int = -1
+        self._label_refresh_timer = QTimer(self)
+        self._label_refresh_timer.setSingleShot(True)
+        self._label_refresh_timer.setInterval(60)
+        self._label_refresh_timer.timeout.connect(self._do_label_refresh)
         self._build_ui()
         self._install_shortcuts()
         self._restore_state()
@@ -695,43 +877,16 @@ class ForgePanel(QWidget):
         self.gpio_port.addItems([f"GPIO{n}" for n in range(2, 28)])
         for widget in (self.projects, self.cameras, self.lines, self.assigned, self.gpio_ports):
             widget.setSpacing(4)
-            widget.setStyleSheet(
-                """
-                QListWidget {
-                    border: 1px solid #2a313a;
-                    border-radius: 6px;
-                    background: #10141b;
-                }
-                QListWidget[dropActive="true"] {
-                    border: 1px dashed #4d8af0;
-                    background: #1a2434;
-                }
-                QListWidget::item {
-                    margin: 2px;
-                    padding: 6px 8px;
-                    border: 1px solid #2a313a;
-                    border-radius: 6px;
-                    background: #171a21;
-                }
-                QListWidget::item:selected {
-                    background: #243043;
-                    border-color: #4d6b8a;
-                }
-                """
-            )
-        self.labels.setStyleSheet(
-            """
-            QListWidget { background:#10141b; border:1px solid #2a313a; border-radius:6px; }
-            QListWidget::item { padding: 0px; }
-            QListWidget::item:selected { background:#243043; }
-            """
-        )
 
         self.line_name = QLineEdit()
         self.line_name.setPlaceholderText("New line name")
         self.component_filter = QLineEdit()
         self.component_filter.setPlaceholderText("Filtrar / pegar labels")
-        self.component_filter.textChanged.connect(self.filter_labels)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(150)
+        self._search_timer.timeout.connect(lambda: self.filter_label_views(self.label_search.text()))
+        self.component_filter.textChanged.connect(lambda _: self._search_timer.start())
 
         self.create_camera_button = QPushButton(" Crear cámara")
         self.create_camera_button.setIcon(_icon("camera-video", size=16, color="accent"))
@@ -778,19 +933,26 @@ class ForgePanel(QWidget):
         self.label_gallery.selected.connect(self._on_gallery_label_selected)
         self.label_search = QLineEdit()
         self.label_search.setPlaceholderText("Buscar label, color o tipo  (presiona / para enfocar)")
-        self.label_search.textChanged.connect(self.filter_label_views)
+        self.label_search.textChanged.connect(lambda _: self._search_timer.start())
         self.label_detail = QLabel("Select a label to inspect")
         self.label_detail.setWordWrap(True)
-        self.label_detail.setStyleSheet("padding:10px; border:1px solid #2a313a; border-radius:8px; background:#111318; color:#d8dde3;")
         self.label_detail_image = QLabel()
         self.label_detail_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label_detail_image.setMinimumHeight(180)
-        self.label_detail_image.setStyleSheet("background:#0f1115; border:1px solid #2a313a; border-radius:8px; color:#8b95a1;")
 
         self.project_preview = QLabel("Preview del proyecto")
         self.project_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.project_preview.setMinimumHeight(220)
-        self.project_preview.setStyleSheet("background:#111318; color:#8b95a1; border:1px solid #2a313a; border-radius:8px;")
+
+        self.graph_view = ForgeGraphWidget()
+        self.graph_view.setContentsMargins(0, 0, 0, 0)
+        self.graph_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.graph_view.assignments_changed.connect(self.graph_assignments_changed.emit)
+        self.graph_view.label_selected.connect(self._select_label_by_name)
+        self.graph_view.label_activated.connect(self._activate_label_from_graph)
+        self.graph_view.camera_selected.connect(self._select_camera_by_id)
+        self.graph_view.set_candidate_gpio_port(self.gpio_port.currentText().strip())
+        self.gpio_port.currentTextChanged.connect(lambda port: self.graph_view.set_candidate_gpio_port(port))
 
         self.gpio_preview = QLabel("GPIO preview")
         self.gpio_preview.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
@@ -798,10 +960,8 @@ class ForgePanel(QWidget):
         self.gpio_preview.setTextFormat(Qt.TextFormat.PlainText)
         self.gpio_preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.gpio_preview.setMinimumHeight(120)
-        self.gpio_preview.setStyleSheet("padding:8px; border:1px solid #2a313a; border-radius:8px; background:#111318; color:#d8dde3;")
 
         self.labels_hint = QLabel("0 labels")
-        self.labels_hint.setStyleSheet("color:#9fb2c8;")
 
         self._build_filter_chips()
         self._build_group_combo()
@@ -842,7 +1002,7 @@ class ForgePanel(QWidget):
         cameras_layout.setContentsMargins(4, 4, 4, 4)
         cameras_layout.setSpacing(6)
         cameras_hint = QLabel("Arrastra labels desde la columna izquierda hacia una cámara.")
-        cameras_hint.setStyleSheet("color:#8b95a1; font-size:11px;")
+        self._cameras_hint = cameras_hint
         cameras_hint.setWordWrap(True)
         cameras_layout.addWidget(cameras_hint)
         cameras_layout.addWidget(self.cameras, 1)
@@ -852,7 +1012,8 @@ class ForgePanel(QWidget):
         gpio_layout.setContentsMargins(4, 4, 4, 4)
         gpio_layout.setSpacing(8)
         ports_header = QLabel("Puertos GPIO en uso")
-        ports_header.setStyleSheet("font-weight:600; color:#9fb2c8;")
+        ports_header.setStyleSheet("font-weight:600;")
+        self._ports_header = ports_header
         gpio_layout.addWidget(ports_header)
         gpio_layout.addWidget(self.gpio_ports, 1)
         self.assigned.setVisible(False)
@@ -882,11 +1043,41 @@ class ForgePanel(QWidget):
         project_layout.addWidget(QLabel("Resumen del proyecto"))
         project_layout.addWidget(self.project_summary)
 
-        right_tabs.addTab(gpio_tab, _icon("cpu", size=16), "GPIO")
-        right_tabs.addTab(cameras_tab, _icon("camera-video", size=16), "Cámaras")
+        manual_tab = QWidget()
+        manual_layout = QVBoxLayout(manual_tab)
+        manual_layout.setContentsMargins(0, 0, 0, 0)
+        manual_layout.setSpacing(6)
+        manual_hint = QLabel(
+            "Fallback manual: usa estas listas mientras el Graph editable se estabiliza."
+        )
+        self._manual_hint = manual_hint
+        manual_hint.setWordWrap(True)
+        manual_tabs = QTabWidget()
+        manual_gpio_row = QWidget()
+        manual_gpio_layout = QHBoxLayout(manual_gpio_row)
+        manual_gpio_layout.setContentsMargins(4, 0, 4, 0)
+        manual_gpio_layout.setSpacing(6)
+        manual_gpio_label = QLabel("GPIO manual")
+        manual_gpio_label.setStyleSheet("font-weight:600; font-size:11px;")
+        self._manual_gpio_label = manual_gpio_label
+        manual_gpio_layout.addWidget(manual_gpio_label)
+        manual_gpio_layout.addWidget(self.gpio_port)
+        manual_gpio_layout.addWidget(self.assign_button)
+        manual_gpio_layout.addWidget(self.bulk_clear_button)
+        manual_gpio_layout.addStretch(1)
+        manual_tabs.addTab(cameras_tab, _icon("camera-video", size=16), "Cámaras")
+        manual_tabs.addTab(gpio_tab, _icon("cpu", size=16), "GPIO")
+        manual_layout.addWidget(manual_hint)
+        manual_layout.addWidget(manual_gpio_row)
+        manual_layout.addWidget(manual_tabs, 1)
+
+        right_tabs.addTab(self.graph_view, _icon("diagram-3", size=16), "Graph")
+        right_tabs.addTab(manual_tab, _icon("sliders", size=16), "Manual")
         right_tabs.addTab(gallery_tab, _icon("grid-3x3-gap", size=16), "Galería")
+        self._label_tab_index = right_tabs.count()
         right_tabs.addTab(label_tab, _icon("tag", size=16), "Label")
         right_tabs.addTab(project_tab, _icon("folder", size=16), "Proyecto")
+        self.manual_tabs = manual_tabs
         self.right_tabs = right_tabs
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -895,6 +1086,7 @@ class ForgePanel(QWidget):
         self._apply_layout_orientation(initial=True)
 
         self.projects.currentRowChanged.connect(lambda r: self._sync_combo_index(self.project_combo, r))
+        self.projects.currentRowChanged.connect(lambda _r: self._sync_graph_project())
         self.cameras.currentRowChanged.connect(lambda r: self._sync_combo_index(self.camera_combo, r))
         self.lines.currentRowChanged.connect(lambda r: self._sync_combo_index(self.line_combo, r))
         self.cameras.currentItemChanged.connect(lambda *_: self._apply_camera_whitelist_to_gallery())
@@ -912,32 +1104,124 @@ class ForgePanel(QWidget):
 
     _SELECTOR_LABEL_QSS = "color:#8b95a1; font-weight:600; font-size:11px;"
 
+    def set_theme(self, theme: str) -> None:
+        from ui.theme import tokens as _tokens
+        t = _tokens(theme)
+
+        _list_qss = f"""
+            QListWidget {{
+                border: 1px solid {t['border']};
+                border-radius: 6px;
+                background: {t['surface']};
+            }}
+            QListWidget[dropActive="true"] {{
+                border: 1px dashed {t['info']};
+                background: {t['hover']};
+            }}
+            QListWidget::item {{
+                margin: 2px;
+                padding: 6px 8px;
+                border: 1px solid {t['border']};
+                border-radius: 6px;
+                background: {t['surface2']};
+            }}
+            QListWidget::item:selected {{
+                background: {t['hover']};
+                border-color: {t['info']};
+            }}
+        """
+        for widget in (self.projects, self.cameras, self.lines, self.assigned, self.gpio_ports):
+            widget.setStyleSheet(_list_qss)
+
+        self.labels.setStyleSheet(
+            f"QListWidget {{ background:{t['surface']}; border:1px solid {t['border']}; border-radius:6px; }}"
+            f"QListWidget::item {{ padding:0px; }}"
+            f"QListWidget::item:selected {{ background:{t['hover']}; }}"
+        )
+
+        _panel_qss = f"padding:8px; border:1px solid {t['border']}; border-radius:8px; background:{t['surface']}; color:{t['text']};"
+        self.label_detail.setStyleSheet(_panel_qss)
+        self.label_detail_image.setStyleSheet(
+            f"background:{t['surface2']}; border:1px solid {t['border']}; border-radius:8px; color:{t['muted']};"
+        )
+        self.gpio_preview.setStyleSheet(
+            f"padding:8px; border:1px solid {t['border']}; border-radius:8px; background:{t['surface']}; color:{t['text']};"
+        )
+        self.project_preview.setStyleSheet(
+            f"background:{t['surface']}; color:{t['muted']}; border:1px solid {t['border']}; border-radius:8px;"
+        )
+        self.labels_hint.setStyleSheet(f"color:{t['muted']}; font-size:11px;")
+        self.coverage_label.setStyleSheet(f"color:{t['muted2']}; font-size:11px;")
+
+        if self.graph_view is not None:
+            self.graph_view.setStyleSheet("")
+            self.graph_view.set_theme(theme)
+        self.label_gallery.set_theme(theme)
+
+        # Toolbar bars — must setStyleSheet directly on the bar widget (not via parent cascade)
+        _bar_qss = f"background:{t['panel']}; border:1px solid {t['border']}; border-radius:8px;"
+        if hasattr(self, "_top_toolbar_bar"):
+            self._top_toolbar_bar.setStyleSheet(f"QWidget#forgeTopBar {{ {_bar_qss} }}")
+        if hasattr(self, "_selector_bar"):
+            self._selector_bar.setStyleSheet(f"QWidget#forgeSelectorBar {{ {_bar_qss} }}")
+
+        # Selector row labels
+        _lbl_qss = f"color:{t['muted']}; font-weight:600; font-size:11px;"
+        for lbl in getattr(self, "_selector_labels", []):
+            lbl.setStyleSheet(_lbl_qss)
+
+        # Status row
+        if hasattr(self, "connection_url_pill"):
+            self.connection_url_pill.setStyleSheet(
+                f"QLabel {{ padding:4px 10px; border-radius:12px; background:{t['surface2']}; color:{t['muted']}; font-size:11px; }}"
+            )
+        for chip in (
+            getattr(self, "connection_pill", None),
+            getattr(self, "labels_chip", None),
+            getattr(self, "cameras_chip", None),
+            getattr(self, "gpio_chip", None),
+        ):
+            if chip is not None:
+                chip.set_theme(theme)
+
+        # Hint labels
+        _hint_qss = f"color:{t['muted']}; font-size:11px;"
+        for lbl in (
+            getattr(self, "_cameras_hint", None),
+            getattr(self, "_manual_hint", None),
+        ):
+            if lbl is not None:
+                lbl.setStyleSheet(_hint_qss)
+        if hasattr(self, "_ports_header"):
+            self._ports_header.setStyleSheet(f"font-weight:600; color:{t['muted']};")
+        if hasattr(self, "_manual_gpio_label"):
+            self._manual_gpio_label.setStyleSheet(f"color:{t['muted']}; font-weight:600; font-size:11px;")
+
+        # Label list delegate
+        if hasattr(self, "labels") and hasattr(self.labels.itemDelegate(), "set_theme"):
+            self.labels.itemDelegate().set_theme(theme)
+            self.labels.viewport().update()
+
     def _build_selector_row(self) -> QWidget:
         bar = QWidget()
         bar.setObjectName("forgeSelectorBar")
-        bar.setStyleSheet(
-            "QWidget#forgeSelectorBar {"
-            " background:#10141b; border:1px solid #2a313a; border-radius:8px; }"
-        )
+        self._selector_bar = bar
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(10, 6, 10, 6)
         layout.setSpacing(6)
 
         proj_label = QLabel("Proyecto")
-        proj_label.setStyleSheet(self._SELECTOR_LABEL_QSS)
         layout.addWidget(proj_label)
         layout.addWidget(self.project_combo)
 
         layout.addSpacing(4)
         cam_label = QLabel("Cámara")
-        cam_label.setStyleSheet(self._SELECTOR_LABEL_QSS)
         layout.addWidget(cam_label)
         layout.addWidget(self.camera_combo)
         layout.addWidget(self.create_camera_button)
 
         layout.addSpacing(4)
         line_label = QLabel("Línea")
-        line_label.setStyleSheet(self._SELECTOR_LABEL_QSS)
         layout.addWidget(line_label)
         layout.addWidget(self.line_combo)
         self.line_name.setMinimumWidth(120)
@@ -945,6 +1229,7 @@ class ForgePanel(QWidget):
         layout.addWidget(self.create_line_button)
 
         layout.addStretch(1)
+        self._selector_labels = [proj_label, cam_label, line_label]
         return bar
 
     def _on_project_combo_changed(self, index: int) -> None:
@@ -982,31 +1267,52 @@ class ForgePanel(QWidget):
             combo.addItem(item.text(), item.data(Qt.ItemDataRole.UserRole))
         combo.blockSignals(False)
 
+    def _sync_graph_project(self) -> None:
+        if not self.graph_view is not None:
+            return
+        item = self.projects.currentItem()
+        if item is None:
+            self.graph_view.set_project("Proyecto")
+            return
+        text = item.text().split(":", 1)[1].strip() if ":" in item.text() else item.text().strip()
+        self.graph_view.set_project(text)
+
+    def _select_camera_by_id(self, camera_id: object) -> None:
+        try:
+            target = int(camera_id)
+        except (TypeError, ValueError):
+            return
+        self.select_camera_by_id(target)
+
+    def _select_label_by_name(self, name: str) -> None:
+        target = name.strip()
+        if not target:
+            return
+        for index in range(self.labels.count()):
+            item = self.labels.item(index)
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(data, dict):
+                continue
+            if str(data.get("name", "")).strip() == target:
+                self.labels.setCurrentItem(item)
+                self._on_label_item_clicked(item)
+                return
+
+    def _activate_label_from_graph(self, name: str) -> None:
+        self._select_label_by_name(name)
+        if self._label_tab_index >= 0:
+            self.right_tabs.setCurrentIndex(self._label_tab_index)
+
     def _build_top_toolbar(self) -> QWidget:
         bar = QWidget()
-        bar.setStyleSheet(
-            "QWidget#forgeTopBar {"
-            " background:#10141b; border:1px solid #2a313a; border-radius:8px; }"
-        )
         bar.setObjectName("forgeTopBar")
+        self._top_toolbar_bar = bar
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(6)
 
         layout.addWidget(self.connect_button)
         layout.addWidget(self.refresh_button)
-        layout.addWidget(self._toolbar_separator())
-
-        gpio_icon = QLabel()
-        gpio_icon.setFixedSize(14, 14)
-        gpio_icon.setPixmap(_icon("plug", size=14, color="muted").pixmap(14, 14))
-        gpio_label = QLabel("GPIO")
-        gpio_label.setStyleSheet("color:#8b95a1;")
-        layout.addWidget(gpio_icon)
-        layout.addWidget(gpio_label)
-        layout.addWidget(self.gpio_port)
-        layout.addWidget(self.assign_button)
-        layout.addWidget(self.bulk_clear_button)
         layout.addWidget(self._toolbar_separator())
         layout.addWidget(self.send_conf_button)
         layout.addWidget(self.download_model_button)
@@ -1031,8 +1337,7 @@ class ForgePanel(QWidget):
 
         self.connection_url_pill = QLabel("—")
         self.connection_url_pill.setStyleSheet(
-            "QLabel { padding:4px 10px; border-radius:12px;"
-            " background:#141820; color:#8b95a1; font-size:11px; }"
+            "QLabel { padding:4px 10px; border-radius:12px; font-size:11px; }"
         )
         self.connection_url_pill.setMaximumWidth(360)
         self.connection_url_pill.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -1074,9 +1379,9 @@ class ForgePanel(QWidget):
         for i in range(count):
             self.splitter.setStretchFactor(i, 1)
         if target == Qt.Orientation.Vertical:
-            self.splitter.setSizes([300] * count)
+            self.splitter.setSizes([200, 700] if count == 2 else [300] * count)
         else:
-            self.splitter.setSizes([500] * count)
+            self.splitter.setSizes([280, 1020] if count == 2 else [500] * count)
         self._current_orientation = target
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -1134,7 +1439,7 @@ class ForgePanel(QWidget):
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
         sep.setFrameShadow(QFrame.Shadow.Plain)
-        sep.setStyleSheet("color:#2a313a;")
+        sep.setStyleSheet("")
         return sep
 
     _CONN_STYLES = {
@@ -1279,6 +1584,7 @@ class ForgePanel(QWidget):
             self.projects.addItem(item)
         if hasattr(self, "project_combo"):
             self._sync_combo_to_list(self.project_combo, self.projects)
+        self._sync_graph_project()
 
     def select_project_by_id(self, project_id: int) -> bool:
         for index in range(self.projects.count()):
@@ -1298,7 +1604,10 @@ class ForgePanel(QWidget):
 
     def set_cameras(self, items: list[tuple[int, str, list[str]]]) -> None:
         self.cameras.clear()
+        graph_cameras: list[dict[str, object]] = []
         for camera_id, name, components in items:
+            if name.strip():
+                graph_cameras.append({"id": camera_id, "name": name.strip()})
             count = len(components)
             suffix = f"  ({count})" if count else ""
             item = QListWidgetItem(f"{camera_id}: {name}{suffix}")
@@ -1315,6 +1624,8 @@ class ForgePanel(QWidget):
             self.cameras.addItem(item)
         if hasattr(self, "camera_combo"):
             self._sync_combo_to_list(self.camera_combo, self.cameras)
+        if self.graph_view is not None:
+            self.graph_view.set_cameras(graph_cameras)
 
     def set_lines(self, items: list[tuple[int, str]]) -> None:
         self.lines.clear()
@@ -1339,7 +1650,9 @@ class ForgePanel(QWidget):
         previous_selected = {item.data(Qt.ItemDataRole.UserRole)["name"] for item in self.labels.selectedItems() if isinstance(item.data(Qt.ItemDataRole.UserRole), dict)}
         self._label_source = list(labels)
         self.labels.clear()
-        normalized = [self._label_dict(label) for label in labels if self._label_dict(label)["name"]]
+        normalized = [d for label in labels for d in [self._label_dict(label)] if d["name"]]
+        if self.graph_view is not None:
+            self.graph_view.set_labels(normalized)
 
         groups = self._group_labels(normalized)
         for header, members in groups:
@@ -1356,9 +1669,7 @@ class ForgePanel(QWidget):
         self.labels_hint.setText(
             f"{len(normalized)} labels (drag a cámaras/GPIO · Ctrl+A para todos los visibles · / para buscar)"
         )
-        self._refresh_label_tooltips()
-        self._update_coverage()
-        self.filter_label_views(self.label_search.text())
+        self._schedule_label_refresh()
 
     def _append_label_item(self, data: dict, *, restore_selection: set[str]) -> None:
         name = data.get("name", "")
@@ -1400,6 +1711,14 @@ class ForgePanel(QWidget):
         ordered = sorted(buckets.items(), key=lambda kv: (-len(kv[1]), kv[0]))
         return [(f"{key.upper()}  ({len(members)})", members) for key, members in ordered]
 
+    def _schedule_label_refresh(self) -> None:
+        QMetaObject.invokeMethod(self._label_refresh_timer, "start", Qt.ConnectionType.QueuedConnection)
+
+    def _do_label_refresh(self) -> None:
+        self._refresh_label_tooltips()
+        self._update_coverage()
+        self.filter_label_views(self.label_search.text())
+
     def _refresh_label_tooltips(self) -> None:
         for i in range(self.labels.count()):
             item = self.labels.item(i)
@@ -1434,11 +1753,8 @@ class ForgePanel(QWidget):
         if item is None:
             self.label_gallery.set_name_whitelist(None)
             return
-        cam_name = item.text().split(":", 1)[-1].strip()
-        names: set[str] = set()
-        for label, cams in self._camera_for_label.items():
-            if any(cam.lower() == cam_name.lower() for cam in cams):
-                names.add(label.lower())
+        cam_name = item.text().split(":", 1)[-1].strip().lower()
+        names = self._label_for_camera.get(cam_name, set())
         self.label_gallery.set_name_whitelist(names if names else set())
 
     def filter_label_views(self, text: str) -> None:
@@ -1529,20 +1845,34 @@ class ForgePanel(QWidget):
             if text and port_text:
                 port_map.setdefault(port_text, []).append(text)
 
-        self.gpio_ports.clear()
-        for port in [f"GPIO{n}" for n in range(2, 28)]:
-            labels = port_map.get(port, [])
-            count = len(labels)
-            suffix = f"  ·  {count} labels" if count else "  ·  vacío"
-            item = QListWidgetItem(f"{port}{suffix}")
-            item.setData(Qt.ItemDataRole.UserRole, port)
-            item.setIcon(_icon("plug", size=16, color="warning" if labels else "muted"))
-            tooltip = f"Drop labels here to assign to {port}"
-            if labels:
-                tooltip += "\n" + "\n".join(f"• {label}" for label in labels)
-            item.setToolTip(tooltip)
-            item.setSizeHint(item.sizeHint() * 1.25)
-            self.gpio_ports.addItem(item)
+        _gpio_ports = [f"GPIO{n}" for n in range(2, 28)]
+        if self.gpio_ports.count() == len(_gpio_ports):
+            for idx, port in enumerate(_gpio_ports):
+                item = self.gpio_ports.item(idx)
+                labels = port_map.get(port, [])
+                count = len(labels)
+                suffix = f"  ·  {count} labels" if count else "  ·  vacío"
+                item.setText(f"{port}{suffix}")
+                item.setIcon(_icon("plug", size=16, color="warning" if labels else "muted"))
+                tooltip = f"Drop labels here to assign to {port}"
+                if labels:
+                    tooltip += "\n" + "\n".join(f"• {label}" for label in labels)
+                item.setToolTip(tooltip)
+        else:
+            self.gpio_ports.clear()
+            for port in _gpio_ports:
+                labels = port_map.get(port, [])
+                count = len(labels)
+                suffix = f"  ·  {count} labels" if count else "  ·  vacío"
+                item = QListWidgetItem(f"{port}{suffix}")
+                item.setData(Qt.ItemDataRole.UserRole, port)
+                item.setIcon(_icon("plug", size=16, color="warning" if labels else "muted"))
+                tooltip = f"Drop labels here to assign to {port}"
+                if labels:
+                    tooltip += "\n" + "\n".join(f"• {label}" for label in labels)
+                item.setToolTip(tooltip)
+                item.setSizeHint(item.sizeHint() * 1.25)
+                self.gpio_ports.addItem(item)
 
         if port_map:
             lines = []
@@ -1559,28 +1889,37 @@ class ForgePanel(QWidget):
             self.gpio_preview.setText("Drop labels onto a GPIO port")
 
         self._gpio_for_label = {str(label): str(port) for label, port in assignments.items() if str(port).strip()}
-        self._refresh_label_tooltips()
-        self._update_coverage()
-        self.filter_label_views(self.label_search.text())
+        if self.graph_view is not None:
+            self.graph_view.set_gpio_assignments(self._gpio_for_label)
+        self.label_gallery.set_assignment_context(self._camera_for_label, self._gpio_for_label)
+        self._schedule_label_refresh()
 
     def set_label_assignments(self, camera_for_label: dict[str, list[str]]) -> None:
         self._camera_for_label = {name: list(cams) for name, cams in (camera_for_label or {}).items()}
-        self._refresh_label_tooltips()
-        self._update_coverage()
-        self.filter_label_views(self.label_search.text())
+        index: dict[str, set[str]] = {}
+        for label, cams in self._camera_for_label.items():
+            for cam in cams:
+                index.setdefault(cam.lower(), set()).add(label.lower())
+        self._label_for_camera = index
+        if self.graph_view is not None:
+            self.graph_view.set_label_assignments(self._camera_for_label)
+        self.label_gallery.set_assignment_context(self._camera_for_label, self._gpio_for_label)
+        self._schedule_label_refresh()
 
     def _update_coverage(self) -> None:
-        total = sum(1 for i in range(self.labels.count()) if not self.labels.item(i).data(Qt.ItemDataRole.UserRole + 1))
-        names: list[str] = []
+        total = with_camera = with_gpio = 0
         for i in range(self.labels.count()):
             item = self.labels.item(i)
             if item.data(Qt.ItemDataRole.UserRole + 1):
                 continue
+            total += 1
             data = item.data(Qt.ItemDataRole.UserRole)
             if isinstance(data, dict):
-                names.append(data.get("name", ""))
-        with_camera = sum(1 for name in names if self._camera_for_label.get(name))
-        with_gpio = sum(1 for name in names if self._gpio_for_label.get(name))
+                name = data.get("name", "")
+                if self._camera_for_label.get(name):
+                    with_camera += 1
+                if self._gpio_for_label.get(name):
+                    with_gpio += 1
         self.coverage_label.setText(f"{total} labels · cám {with_camera}/{total} · gpio {with_gpio}/{total}")
 
         if not hasattr(self, "labels_chip"):
@@ -1627,6 +1966,7 @@ class ForgePanel(QWidget):
 
     def set_label_previews(self, items: list[dict]) -> None:
         self._label_source = list(items)
+        self.label_gallery.set_assignment_context(self._camera_for_label, self._gpio_for_label)
         self.label_gallery.set_items(items)
         if items:
             self.set_selected_label_preview(items[0])
@@ -1675,6 +2015,10 @@ class ForgePanel(QWidget):
         if isinstance(data, dict):
             self.set_selected_label_preview(data)
             self.label_selected.emit(data)
+            name = str(data.get("name", "")).strip()
+            if name and self.graph_view is not None:
+                self.right_tabs.setCurrentIndex(0)
+                self.graph_view.focus_label(name)
 
     def _emit_bulk_clear(self) -> None:
         labels = self.selected_labels()

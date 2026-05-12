@@ -40,7 +40,7 @@ from core.video_source import (
     save_inference_source_config,
 )
 from ui.icons import icon
-from ui.theme import settings_panel_stylesheet
+from ui.theme import settings_panel_stylesheet, tokens
 
 
 class SettingsPanel(QWidget):
@@ -72,8 +72,14 @@ class SettingsPanel(QWidget):
         self.set_theme("dark")
 
     def set_theme(self, theme: str) -> None:
+        self._theme = theme
         self.setStyleSheet(settings_panel_stylesheet(theme))
         self._apply_icons()
+        t = tokens(theme)
+        if hasattr(self, "env_file"):
+            self.env_file.setStyleSheet(f"font-size: 11px; color: {t['muted2']};")
+        if hasattr(self, "forge_test_status"):
+            self.forge_test_status.setStyleSheet(f"color:{t['muted']}; font-size:11px;")
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -85,7 +91,7 @@ class SettingsPanel(QWidget):
         env_layout.setSpacing(12)
 
         self.env_file = QLineEdit(str(self._env_path.resolve()))
-        self.env_file.setStyleSheet("font-size: 11px; color: #6c7680;")
+        self.env_file.setStyleSheet("font-size: 11px;")
         env_file_row = QHBoxLayout()
         env_file_row.setSpacing(8)
         env_file_row.addWidget(self.env_file, 1)
@@ -102,7 +108,7 @@ class SettingsPanel(QWidget):
         env_layout.addLayout(env_file_row)
 
         self.forge_test_status = QLabel("")
-        self.forge_test_status.setStyleSheet("color:#8b95a1; font-size:11px;")
+        self.forge_test_status.setStyleSheet("font-size:11px;")
         env_layout.addWidget(self.forge_test_status)
 
         form = QFormLayout()
@@ -468,6 +474,8 @@ class SettingsPanel(QWidget):
         header = QHBoxLayout()
         header.setSpacing(8)
 
+        t = tokens(getattr(self, "_theme", "dark"))
+
         def _badge(text: str, icon_name: str, color: str, text_color: str) -> QWidget:
             badge = QWidget()
             badge_layout = QHBoxLayout(badge)
@@ -489,35 +497,34 @@ class SettingsPanel(QWidget):
 
         name_badge = QLabel(name)
         name_badge.setObjectName("badge")
-        name_badge.setStyleSheet("font-size: 12px; font-weight: 600; color: #e6eaf2;")
+        name_badge.setStyleSheet("font-size: 12px; font-weight: 600;")
         header.addWidget(name_badge)
 
         header.addStretch(1)
 
         if is_default:
-            header.addWidget(_badge("Default", "star-fill", "warning", "#f4b942"))
+            header.addWidget(_badge("Default", "star-fill", "warning", t["warning"]))
 
         header.addWidget(
             _badge(
                 "Activo" if enabled else "Inactivo",
                 "check-circle" if enabled else "x-circle",
                 "accent" if enabled else "danger",
-                "#62d2a2" if enabled else "#e66b6b",
+                t["accent"] if enabled else t["danger"],
             )
         )
 
         card_layout.addLayout(header)
-
         details = QHBoxLayout()
         details.setSpacing(12)
         url_display = QLabel(url if url else "(sin URL)")
-        url_display.setStyleSheet("color: #6c7680; font-size: 10px;")
+        url_display.setStyleSheet(f"color: {t['muted2']}; font-size: 10px;")
         url_display.setWordWrap(True)
         details.addWidget(url_display, 1)
 
         if username:
             user_label = QLabel(f"@{username}")
-            user_label.setStyleSheet("color: #6c7680; font-size: 10px;")
+            user_label.setStyleSheet(f"color: {t['muted2']}; font-size: 10px;")
             details.addWidget(user_label)
 
         card_layout.addLayout(details)
@@ -559,15 +566,16 @@ class SettingsPanel(QWidget):
             self._highlight_card(0)
 
     def _highlight_card(self, index: int) -> None:
+        t = tokens(getattr(self, "_theme", "dark"))
         for i, entry in enumerate(self._rtsp_card_widgets):
             card = entry["card"]
             if i == index and index >= 0:
                 card.setStyleSheet(
-                    "QFrame#rtspCard { background: #171a21; border: 2px solid #62d2a2; border-radius: 10px; padding: 12px; }"
+                    f"QFrame#rtspCard {{ background: {t['surface']}; border: 2px solid {t['accent']}; border-radius: 10px; padding: 12px; }}"
                 )
             else:
                 card.setStyleSheet(
-                    "QFrame#rtspCard { background: #171a21; border: 1px solid #2a313a; border-radius: 10px; padding: 12px; }"
+                    f"QFrame#rtspCard {{ background: {t['surface']}; border: 1px solid {t['border']}; border-radius: 10px; padding: 12px; }}"
                 )
 
     def _make_card_click_handler(self, index: int):
@@ -617,7 +625,8 @@ class SettingsPanel(QWidget):
 
     def _on_test_forge_clicked(self) -> None:
         self.forge_test_status.setText("Probando…")
-        self.forge_test_status.setStyleSheet("color:#f4cd6b; font-size:11px;")
+        t = tokens(getattr(self, "_theme", "dark"))
+        self.forge_test_status.setStyleSheet(f"color:{t['warning']}; font-size:11px;")
         self.forge_test_requested.emit({
             "FORGE_URL": self.forge_url.text().strip(),
             "FORGE_USERNAME": self.forge_user.text().strip(),
@@ -626,12 +635,13 @@ class SettingsPanel(QWidget):
         })
 
     def set_forge_test_result(self, ok: bool, detail: str = "") -> None:
+        t = tokens(getattr(self, "_theme", "dark"))
         if ok:
             self.forge_test_status.setText(f"✓ Conexión OK · {detail}".strip(" ·"))
-            self.forge_test_status.setStyleSheet("color:#62d2a2; font-size:11px;")
+            self.forge_test_status.setStyleSheet(f"color:{t['accent']}; font-size:11px;")
         else:
             self.forge_test_status.setText(f"✗ {detail or 'Error de conexión'}")
-            self.forge_test_status.setStyleSheet("color:#e66b6b; font-size:11px;")
+            self.forge_test_status.setStyleSheet(f"color:{t['danger']}; font-size:11px;")
 
     def save_env(self) -> None:
         path = Path(self.env_file.text().strip() or ".env")
@@ -688,13 +698,15 @@ class SettingsPanel(QWidget):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(source.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
         except Exception as exc:
+            t = tokens(getattr(self, "_theme", "dark"))
             self.forge_test_status.setText(f"No se pudo importar .env: {exc}")
-            self.forge_test_status.setStyleSheet("color:#e66b6b; font-size:11px;")
+            self.forge_test_status.setStyleSheet(f"color:{t['danger']}; font-size:11px;")
             return
 
         self.load_env()
+        t = tokens(getattr(self, "_theme", "dark"))
         self.forge_test_status.setText(f".env importado desde {source.name}")
-        self.forge_test_status.setStyleSheet("color:#62d2a2; font-size:11px;")
+        self.forge_test_status.setStyleSheet(f"color:{t['accent']}; font-size:11px;")
         self.env_changed.emit(read_env_file(target))
 
     def import_video_source_file(self) -> None:
@@ -746,33 +758,35 @@ class SettingsPanel(QWidget):
         }
 
     def _set_rtsp_status(self, text: str, *, ok: bool | None = None) -> None:
-        color = "#9fb2c8"
+        t = tokens(getattr(self, "_theme", "dark"))
         self.rtsp_status.setObjectName("")
         if ok is True:
-            color = "#62d2a2"
+            color = t["accent"]
             self.rtsp_status.setObjectName("statusOk")
             icon_name, icon_color = "check-circle", "accent"
         elif ok is False:
-            color = "#e66b6b"
+            color = t["danger"]
             self.rtsp_status.setObjectName("statusOff")
             icon_name, icon_color = "x-circle", "danger"
+        else:
+            color = t["muted"]
+            icon_name, icon_color = "info-circle", "info"
         self.rtsp_status.setStyleSheet(f"color:{color};")
         self.rtsp_status.setText(text)
-        if ok is None:
-            icon_name, icon_color = "info-circle", "info"
         self.rtsp_status_icon.setPixmap(icon(icon_name, size=16, color=icon_color).pixmap(16, 16))
 
     def _set_source_status(self, text: str, *, icon_name: str = "info-circle", icon_color: str = "info") -> None:
         self.source_status.setText(text)
         self.source_status_icon.setPixmap(icon(icon_name, size=16, color=icon_color).pixmap(16, 16))
+        t = tokens(getattr(self, "_theme", "dark"))
         color_map = {
-            "info": "#9fb2c8",
-            "accent": "#62d2a2",
-            "warning": "#f4b942",
-            "danger": "#e66b6b",
-            "muted": "#6c7680",
+            "info": t["info"],
+            "accent": t["accent"],
+            "warning": t["warning"],
+            "danger": t["danger"],
+            "muted": t["muted2"],
         }
-        self.source_status.setStyleSheet(f"color:{color_map.get(icon_color, '#9fb2c8')};")
+        self.source_status.setStyleSheet(f"color:{color_map.get(icon_color, t['muted'])};")
 
     def _refresh_rtsp_list(self, *, select_name: str | None = None) -> None:
         self.rtsp_list.blockSignals(True)
@@ -830,14 +844,15 @@ class SettingsPanel(QWidget):
             self.rtsp_summary.setText("Sin cámaras RTSP registradas.")
             icon_name, icon_color = "slash-circle", "muted"
         self.rtsp_summary_icon.setPixmap(icon(icon_name, size=16, color=icon_color).pixmap(16, 16))
+        t = tokens(getattr(self, "_theme", "dark"))
         color_map = {
-            "info": "#9fb2c8",
-            "accent": "#62d2a2",
-            "warning": "#f4b942",
-            "danger": "#e66b6b",
-            "muted": "#6c7680",
+            "info": t["info"],
+            "accent": t["accent"],
+            "warning": t["warning"],
+            "danger": t["danger"],
+            "muted": t["muted2"],
         }
-        self.rtsp_summary.setStyleSheet(f"color:{color_map.get(icon_color, '#9fb2c8')};")
+        self.rtsp_summary.setStyleSheet(f"color:{color_map.get(icon_color, t['muted'])};")
 
     def _load_selected_rtsp_camera(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
         if current is None:
@@ -973,20 +988,21 @@ class SettingsPanel(QWidget):
         cam_icon.setFixedSize(18, 18)
         header.addWidget(cam_icon)
 
+        t = tokens(getattr(self, "_theme", "dark"))
         name_badge = QLabel(name)
         name_badge.setObjectName("badge")
-        name_badge.setStyleSheet("font-size: 12px; font-weight: 600; color: #e6eaf2;")
+        name_badge.setStyleSheet("font-size: 12px; font-weight: 600;")
         header.addWidget(name_badge)
 
         kind_badge = QLabel(kind.upper())
         kind_badge.setObjectName("badge")
-        kind_badge.setStyleSheet("font-size: 10px; font-weight: 600; color: #9fb2c8;")
+        kind_badge.setStyleSheet(f"font-size: 10px; font-weight: 600; color: {t['muted']};")
         header.addWidget(kind_badge)
 
         header.addStretch(1)
 
         status_text = "Activa" if enabled else "Inactiva"
-        status_color = "#62d2a2" if enabled else "#e66b6b"
+        status_color = t["accent"] if enabled else t["danger"]
         status_label = QLabel(status_text)
         status_label.setStyleSheet(f"color: {status_color}; font-size: 11px; font-weight: 600;")
         header.addWidget(status_label)
@@ -997,7 +1013,7 @@ class SettingsPanel(QWidget):
         if backend:
             details_text = f"{details_text}  ·  {backend}"
         details = QLabel(details_text)
-        details.setStyleSheet("color: #6c7680; font-size: 10px;")
+        details.setStyleSheet(f"color: {t['muted2']}; font-size: 10px;")
         details.setWordWrap(True)
         card_layout.addWidget(details)
 
@@ -1022,7 +1038,8 @@ class SettingsPanel(QWidget):
             card = self._build_local_card(camera, idx)
             card.mousePressEvent = self._make_local_card_click_handler(idx)
             if self._local_selected_index == idx:
-                card.setStyleSheet(card.styleSheet() + "QFrame#rtspCard { border-color: #62d2a2; }")
+                t = tokens(getattr(self, "_theme", "dark"))
+                card.setStyleSheet(card.styleSheet() + f"QFrame#rtspCard {{ border-color: {t['accent']}; }}")
             self.local_cards_container.addWidget(card)
             self._local_card_widgets.append({"card": card, "index": idx})
 

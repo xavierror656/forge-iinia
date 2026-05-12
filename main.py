@@ -178,6 +178,8 @@ class InferenceWorker(QThread):
             return palette[0]
         return palette[sum(ord(ch) for ch in label) % len(palette)]
 
+    _MAX_FRAME_W = 960
+
     def _frame_to_qimage(self, frame: Any) -> QImage | None:
         if frame is None:
             return None
@@ -191,6 +193,10 @@ class InferenceWorker(QThread):
         except Exception:
             return None
         height, width = rgb.shape[:2]
+        if width > self._MAX_FRAME_W:
+            new_h = int(height * self._MAX_FRAME_W / width)
+            rgb = cv2.resize(rgb, (self._MAX_FRAME_W, new_h), interpolation=cv2.INTER_LINEAR)
+            height, width = rgb.shape[:2]
         bytes_per_line = rgb.strides[0]
         return QImage(rgb.data, width, height, bytes_per_line, QImage.Format.Format_RGB888 if rgb.shape[2] == 3 else QImage.Format.Format_RGBA8888).copy()
 
@@ -601,6 +607,7 @@ class GPIOWorker(QThread):
         self._stop_requested = True
 
     def enqueue_detection(self, label: str, camera_id: str, active: bool) -> None:
+        # queue.Queue.put() is thread-safe — called from inference thread via Qt auto-connection
         self._events.put((label, camera_id, active))
 
     def set_assignments(self, assignments: dict[str, str]) -> None:
@@ -948,6 +955,7 @@ class MainWindow(QMainWindow):
         self.forge_panel.label_selected.connect(self._suggest_targets_for_label)
         self.forge_panel.camera_labels_dropped.connect(self._on_camera_labels_dropped)
         self.forge_panel.gpio_ports.labels_dropped.connect(self._on_gpio_labels_dropped)
+        self.forge_panel.graph_assignments_changed.connect(self._on_graph_assignments_changed)
         self.forge_panel.create_camera_button.clicked.connect(self._create_forge_camera)
         self.forge_panel.create_line_button.clicked.connect(self._create_forge_line)
         self.forge_panel.assign_button.clicked.connect(self._assign_components_to_camera)
@@ -959,7 +967,8 @@ class MainWindow(QMainWindow):
     def _build_live_tab(self) -> QWidget:
         profile = self._hardware.ui_profile
         video_box = self._build_video_box(profile)
-        side_box = self._build_side_box()
+        self._side_box = self._build_side_box()
+        side_box = self._side_box
 
         live_tab = QWidget()
         outer = QVBoxLayout(live_tab)
@@ -1033,9 +1042,7 @@ class MainWindow(QMainWindow):
         status_row_layout.setContentsMargins(0, 0, 0, 0)
         status_row_layout.setSpacing(8)
         self.status_banner = QLabel("Ready")
-        self.status_banner.setStyleSheet(
-            "padding: 6px 10px; border-radius: 6px; background: #1b2028; color: #d8dde3;"
-        )
+        self.status_banner.setStyleSheet("padding: 6px 10px; border-radius: 6px;")
         status_row_layout.addWidget(self.status_banner_icon)
         status_row_layout.addWidget(self.status_banner, 1)
         video_layout.addWidget(status_row)
@@ -1049,9 +1056,7 @@ class MainWindow(QMainWindow):
         stream_row_layout.setSpacing(8)
         self.stream_banner = QLabel("Fuente de video pendiente...")
         self.stream_banner.setWordWrap(True)
-        self.stream_banner.setStyleSheet(
-            "padding: 6px 10px; border-radius: 6px; background: #141820; color: #cfd6e1;"
-        )
+        self.stream_banner.setStyleSheet("padding: 6px 10px; border-radius: 6px;")
         stream_row_layout.addWidget(self.stream_banner_icon)
         stream_row_layout.addWidget(self.stream_banner, 1)
         video_layout.addWidget(stream_row)
@@ -1065,9 +1070,7 @@ class MainWindow(QMainWindow):
         pool_row_layout.setSpacing(8)
         self.pool_banner = QLabel("")
         self.pool_banner.setWordWrap(True)
-        self.pool_banner.setStyleSheet(
-            "padding: 4px 10px; border-radius: 6px; background: #141820; color: #9aa6b2; font-size: 11px;"
-        )
+        self.pool_banner.setStyleSheet("padding: 4px 10px; border-radius: 6px; font-size: 11px;")
         self.pool_banner.setVisible(False)
         pool_row_layout.addWidget(self.pool_banner_icon)
         pool_row_layout.addWidget(self.pool_banner, 1)
@@ -1178,7 +1181,6 @@ class MainWindow(QMainWindow):
     def _build_tile(self, camera_id: str) -> tuple[QWidget, OpenGLVideoWidget, QLabel]:
         tile = QFrame()
         tile.setFrameShape(QFrame.Shape.StyledPanel)
-        tile.setStyleSheet("QFrame { background:#0d1014; border:1px solid #2a313a; border-radius:6px; }")
         layout = QVBoxLayout(tile)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
@@ -1189,7 +1191,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(video, 1)
 
         badge = QLabel(camera_id)
-        badge.setStyleSheet(self._TILE_BADGE_QSS_ONLINE)
+        badge.setStyleSheet(getattr(self, "_tile_badge_qss_online", self._TILE_BADGE_QSS_ONLINE))
         badge.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(badge, 0)
         return tile, video, badge
@@ -1227,22 +1229,21 @@ class MainWindow(QMainWindow):
             cam_id = self._tile_camera_ids[i]
             if offline:
                 badge.setText(f"●  {cam_id}  ·  offline")
-                badge.setStyleSheet(self._TILE_BADGE_QSS_OFFLINE)
+                badge.setStyleSheet(getattr(self, "_tile_badge_qss_offline", self._TILE_BADGE_QSS_OFFLINE))
             else:
                 badge.setText(f"{cam_id}  ·  {fps:.1f} FPS")
-                badge.setStyleSheet(self._TILE_BADGE_QSS_ONLINE)
+                badge.setStyleSheet(getattr(self, "_tile_badge_qss_online", self._TILE_BADGE_QSS_ONLINE))
 
     def _build_side_box(self) -> QWidget:
         side_box = QFrame()
         side_box.setFrameShape(QFrame.Shape.StyledPanel)
-        side_box.setStyleSheet("QFrame { background:#11141a; border:1px solid #2a313a; border-radius:8px; }")
         side_layout = QVBoxLayout(side_box)
         side_layout.setContentsMargins(12, 12, 12, 12)
         side_layout.setSpacing(8)
 
-        title = QLabel("Telemetría")
-        title.setStyleSheet("font-weight:600; color:#9fb2c8;")
-        side_layout.addWidget(title)
+        self._telemetry_title = QLabel("Telemetría")
+        self._telemetry_title.setStyleSheet("font-weight:600;")
+        side_layout.addWidget(self._telemetry_title)
 
         telemetry_grid = QGridLayout()
         telemetry_grid.setHorizontalSpacing(12)
@@ -1253,8 +1254,11 @@ class MainWindow(QMainWindow):
         self.ram = QLabel("0 MB")
         self.vram = QLabel("0 MB")
         self.temperature = QLabel("0 °C")
-        for value_label in (self.fps_capture, self.fps_inference, self.latency, self.ram, self.vram, self.temperature):
-            value_label.setStyleSheet("font-weight:600; color:#e6eaf2;")
+        self._telemetry_value_labels = (
+            self.fps_capture, self.fps_inference, self.latency, self.ram, self.vram, self.temperature
+        )
+        for value_label in self._telemetry_value_labels:
+            value_label.setStyleSheet("font-weight:600;")
         self.fps_capture_spark = Sparkline(color="#62d2a2")
         self.fps_inference_spark = Sparkline(color="#5aa9e6")
         self.latency_spark = Sparkline(color="#f4b942")
@@ -1268,12 +1272,13 @@ class MainWindow(QMainWindow):
             ("cpu", "VRAM", self.vram, None),
             ("thermometer-half", "SoC", self.temperature, None),
         ]
+        self._telemetry_key_labels: list[QLabel] = []
         for row, (icon_name, label_text, value_widget, spark) in enumerate(rows):
             icon_label = QLabel()
             icon_label.setPixmap(_icon(icon_name, size=14, color="muted").pixmap(14, 14))
             icon_label.setFixedSize(16, 16)
             key = QLabel(label_text)
-            key.setStyleSheet("color:#8b95a1;")
+            self._telemetry_key_labels.append(key)
             telemetry_grid.addWidget(icon_label, row, 0)
             telemetry_grid.addWidget(key, row, 1)
             telemetry_grid.addWidget(value_widget, row, 2)
@@ -1291,7 +1296,8 @@ class MainWindow(QMainWindow):
         health_icon.setFixedSize(16, 16)
         health_icon.setPixmap(_icon("heart-pulse", size=16, color="info").pixmap(16, 16))
         health_label = QLabel("Health")
-        health_label.setStyleSheet("color:#8b95a1;")
+        self._health_label = health_label
+        self._health_icon = health_icon
         health_row_layout.addWidget(health_icon)
         health_row_layout.addWidget(health_label)
         health_row_layout.addStretch(1)
@@ -1302,8 +1308,8 @@ class MainWindow(QMainWindow):
         self.health_bar.setTextVisible(False)
         self.health_bar.setFixedHeight(8)
         self.health_bar.setStyleSheet(
-            "QProgressBar { background:#0f1115; border:1px solid #2a313a; border-radius:4px; }"
-            "QProgressBar::chunk { background:#62d2a2; border-radius:4px; }"
+            "QProgressBar { border-radius:4px; }"
+            "QProgressBar::chunk { border-radius:4px; }"
         )
         side_layout.addWidget(self.health_bar)
 
@@ -1656,18 +1662,16 @@ class MainWindow(QMainWindow):
             self.stream_banner_icon.setPixmap(_icon(icon_name, size=16, color=icon_color).pixmap(16, 16))
         self.video_widget.set_status(text)
 
+        dark = self.dark_mode_switch.isChecked()
         if active:
-            bg = "#163122" if kind != "RTSP" else "#1d2f4a"
-            fg = "#eaf7ef" if kind != "RTSP" else "#e7f0ff"
-            border = "#2f6b52" if kind != "RTSP" else "#45678d"
+            if kind == "RTSP":
+                bg, fg, border = ("#1d2f4a", "#e7f0ff", "#45678d") if dark else ("#ddeeff", "#1a3a5c", "#5080b0")
+            else:
+                bg, fg, border = ("#163122", "#eaf7ef", "#2f6b52") if dark else ("#dff7ec", "#1a5c3a", "#4caf7d")
         elif source.get("source"):
-            bg = "#3a3017"
-            fg = "#f6e7bf"
-            border = "#7a6124"
+            bg, fg, border = ("#3a3017", "#f6e7bf", "#7a6124") if dark else ("#fef9ec", "#7a5200", "#c89030")
         else:
-            bg = "#341d22"
-            fg = "#f7d7de"
-            border = "#7b3945"
+            bg, fg, border = ("#341d22", "#f7d7de", "#7b3945") if dark else ("#fdeef0", "#8a1c28", "#d06070")
         self.stream_banner.setStyleSheet(
             f"padding: 6px 10px; border-radius: 6px; background: {bg}; color: {fg}; border: 1px solid {border};"
         )
@@ -1680,6 +1684,8 @@ class MainWindow(QMainWindow):
         app.setProperty("uiTheme", theme)
         _clear_icon_cache()
         app.setStyleSheet(app_stylesheet(theme))
+        if hasattr(self, "forge_panel") and self.forge_panel is not None:
+            self.forge_panel.set_theme(theme)
         if hasattr(self, "settings_panel") and self.settings_panel is not None:
             self.settings_panel.set_theme(theme)
         self._refresh_theme_assets()
@@ -1700,8 +1706,42 @@ class MainWindow(QMainWindow):
             )
         if hasattr(self, "pool_banner"):
             self.pool_banner.setStyleSheet(
-                f"padding: 6px 10px; border-radius: 6px; background:{t['surface']}; color:{t['muted']}; border:1px solid {t['border']};"
+                f"padding: 4px 10px; border-radius: 6px; font-size: 11px; background:{t['surface']}; color:{t['muted']}; border:1px solid {t['border']};"
             )
+        if hasattr(self, "_side_box"):
+            self._side_box.setStyleSheet(
+                f"QFrame {{ background:{t['panel']}; border:1px solid {t['border']}; border-radius:8px; }}"
+            )
+        if hasattr(self, "_telemetry_title"):
+            self._telemetry_title.setStyleSheet(f"font-weight:600; color:{t['muted']};")
+        if hasattr(self, "_telemetry_value_labels"):
+            for lbl in self._telemetry_value_labels:
+                lbl.setStyleSheet(f"font-weight:600; color:{t['text']};")
+        if hasattr(self, "_telemetry_key_labels"):
+            for lbl in self._telemetry_key_labels:
+                lbl.setStyleSheet(f"color:{t['muted']};")
+        if hasattr(self, "_health_label"):
+            self._health_label.setStyleSheet(f"color:{t['muted']};")
+        if hasattr(self, "health_bar"):
+            self.health_bar.setStyleSheet(
+                f"QProgressBar {{ background:{t['bg']}; border:1px solid {t['border']}; border-radius:4px; }}"
+                f"QProgressBar::chunk {{ background:{t['accent']}; border-radius:4px; }}"
+            )
+        # Tile badges
+        self._tile_badge_qss_online = (
+            f"padding: 2px 6px; background: rgba(0,0,0,0.35); color: {t['text']};"
+            " font-size: 10px; border-radius: 4px;"
+        )
+        self._tile_badge_qss_offline = (
+            f"padding: 2px 6px; background: rgba(0,0,0,0.35); color: {t['danger']};"
+            " font-size: 10px; border-radius: 4px;"
+        )
+        if hasattr(self, "_tile_badges"):
+            for badge in self._tile_badges:
+                if "offline" in badge.text():
+                    badge.setStyleSheet(self._tile_badge_qss_offline)
+                else:
+                    badge.setStyleSheet(self._tile_badge_qss_online)
         self._set_status(self.status_banner.text() if hasattr(self, "status_banner") else "")
         self._refresh_live_summary()
         self._refresh_pool_banner()
@@ -2033,6 +2073,98 @@ class MainWindow(QMainWindow):
         self._toast.show(f"{n} label{'s' if n != 1 else ''} → {port}  ({preview})", severity="success")
         self._push_assignment_history(f"Drop {n} → {port}")
 
+    def _on_graph_assignments_changed(self, camera_assignments: dict, gpio_assignments: dict) -> None:
+        project_id = self.forge_panel.selected_project_id()
+        if project_id is None:
+            self.forge_panel.graph_view.mark_error("Sin proyecto")
+            self._append_log("Select a project before editing the Forge graph.")
+            return
+
+        cleaned_camera: dict[str, list[str]] = {}
+        for raw_camera_id, raw_labels in camera_assignments.items():
+            try:
+                camera_id = str(int(raw_camera_id))
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(raw_labels, list):
+                continue
+            labels = [label for label in (self._normalize_label_name(raw) for raw in raw_labels) if label]
+            cleaned_camera[camera_id] = list(dict.fromkeys(labels))
+
+        cleaned_gpio: dict[str, str] = {}
+        for raw_label, raw_port in gpio_assignments.items():
+            label = self._normalize_label_name(raw_label)
+            port = str(raw_port).strip()
+            if label and port:
+                cleaned_gpio[label] = port
+
+        previous_camera = {key: list(value) for key, value in self._camera_assignments.items()}
+        previous_gpio = self._current_gpio_assignments()
+        if previous_camera == cleaned_camera and previous_gpio == cleaned_gpio:
+            self.forge_panel.graph_view.mark_saved()
+            return
+
+        self._camera_assignments = cleaned_camera
+        self._save_local_assignments()
+        self._refresh_label_assignment_index()
+
+        project_key = str(project_id)
+        if cleaned_gpio:
+            self._gpio_assignments[project_key] = cleaned_gpio
+        else:
+            self._gpio_assignments.pop(project_key, None)
+        self._save_gpio_assignments()
+        self.forge_panel.set_gpio_assignments(cleaned_gpio)
+        self._gpio_worker.set_assignments(cleaned_gpio)
+        self._sync_selected_camera_assignments()
+
+        changed_cameras = [
+            int(camera_id)
+            for camera_id, labels in cleaned_camera.items()
+            if previous_camera.get(camera_id, []) != labels
+        ]
+        self._append_log(
+            f"Graph assignments saved: {sum(len(v) for v in cleaned_camera.values())} camera links, "
+            f"{len(cleaned_gpio)} GPIO links."
+        )
+        self._toast.show("Graph guardado", severity="success")
+        self._push_assignment_history("Graph edit")
+
+        if not changed_cameras:
+            self.forge_panel.graph_view.mark_saved()
+            return
+
+        def sync_cameras() -> int:
+            for camera_id in changed_cameras:
+                labels = cleaned_camera.get(str(camera_id), [])
+                self._forge.update_camera(camera_id, {"labels": labels, "assigned_components": labels, "components": labels})
+            return len(changed_cameras)
+
+        def _rollback(err: str) -> None:
+            self._camera_assignments = previous_camera
+            self._save_local_assignments()
+            self._refresh_label_assignment_index()
+            if previous_gpio:
+                self._gpio_assignments[project_key] = previous_gpio
+            else:
+                self._gpio_assignments.pop(project_key, None)
+            self._save_gpio_assignments()
+            self.forge_panel.set_gpio_assignments(previous_gpio)
+            self._gpio_worker.set_assignments(previous_gpio)
+            self._sync_selected_camera_assignments()
+            self.forge_panel.graph_view.mark_error("Sync falló")
+            self._report_error("Forge graph sync failed", RuntimeError(err))
+
+        self._run_async(
+            sync_cameras,
+            on_ok=lambda count: (
+                self.forge_panel.graph_view.mark_saved(),
+                self._append_log(f"Forge graph sync updated {count} cameras."),
+            ),
+            on_error=_rollback,
+            busy_text="Syncing graph assignments to Forge...",
+        )
+
     def _camera_display_name(self, camera_id: int) -> str:
         for i in range(self.forge_panel.cameras.count()):
             item = self.forge_panel.cameras.item(i)
@@ -2260,28 +2392,33 @@ class MainWindow(QMainWindow):
             pass
 
     def _wire_threads(self) -> None:
+        # QThread subclasses have main-thread affinity, so AutoConnection may use
+        # DirectConnection even for signals emitted inside run(). Force QueuedConnection
+        # on all connections that touch UI from worker signals to prevent startTimer
+        # warnings from statusBar().showMessage() and animation starts.
+        _Q = Qt.ConnectionType.QueuedConnection
         primary = self._inference_workers[0]
-        primary.source_ready.connect(self._on_source_ready)
-        primary.telemetry_ready.connect(self._update_telemetry)
-        primary.model_loaded.connect(lambda model: self._set_status(f"Model: {model}"))
+        primary.source_ready.connect(self._on_source_ready, _Q)
+        primary.telemetry_ready.connect(self._update_telemetry, _Q)
+        primary.model_loaded.connect(lambda model: self._set_status(f"Model: {model}"), _Q)
 
         tiles = getattr(self, "_tiles", None) or [self.video_widget]
         for index, worker in enumerate(self._inference_workers):
             tile = tiles[index] if index < len(tiles) else self.video_widget
-            worker.frame_ready.connect(tile.set_frame)
+            worker.frame_ready.connect(tile.set_frame, _Q)
             worker.frame_ready.connect(
-                lambda frame, cam=worker.camera_id: self._publish_inference_outputs(frame, cam)
+                lambda frame, cam=worker.camera_id: self._publish_inference_outputs(frame, cam), _Q
             )
-            worker.frame_ready.connect(lambda _frame, idx=index: self._on_tile_frame(idx))
-            worker.log_message.connect(self._append_log)
+            worker.frame_ready.connect(lambda _frame, idx=index: self._on_tile_frame(idx), _Q)
+            worker.log_message.connect(self._append_log, _Q)
             worker.detection_event.connect(self._gpio_worker.enqueue_detection)
             worker.frozen.connect(
-                lambda cam=worker.camera_id: self._handle_worker_frozen(cam)
+                lambda cam=worker.camera_id: self._handle_worker_frozen(cam), _Q
             )
-        self._gpio_worker.log_message.connect(self._append_log)
+        self._gpio_worker.log_message.connect(self._append_log, _Q)
         for watchdog in self._watchdogs:
-            watchdog.log_message.connect(self._append_log)
-            watchdog.restart_requested.connect(self._restart_inference)
+            watchdog.log_message.connect(self._append_log, _Q)
+            watchdog.restart_requested.connect(self._restart_inference, _Q)
 
     def _start_threads(self) -> None:
         self._append_log(f"Selected backend: {self._hardware.info.camera_backend} / {self._hardware.info.gpio_backend}")
@@ -2309,9 +2446,24 @@ class MainWindow(QMainWindow):
 
     def _update_telemetry(self, telemetry: dict) -> None:
         self._latest_telemetry = dict(telemetry)
-        capture_fps = float(telemetry.get('capture_fps', 0.0))
-        inference_fps = float(telemetry.get('inference_fps', 0.0))
-        latency_ms = float(telemetry.get('latency_ms', 0.0))
+        now = time.monotonic()
+
+        # Sparklines: 4 Hz max (every 250 ms)
+        if now - getattr(self, "_last_spark_t", 0.0) >= 0.25:
+            self._last_spark_t = now
+            if hasattr(self, "fps_capture_spark"):
+                self.fps_capture_spark.push(float(telemetry.get("capture_fps", 0.0) or 0.0))
+                self.fps_inference_spark.push(float(telemetry.get("inference_fps", 0.0) or 0.0))
+                self.latency_spark.push(float(telemetry.get("latency_ms", 0.0) or 0.0))
+
+        # Labels + status: 2 Hz max (every 500 ms)
+        if now - getattr(self, "_last_telemetry_ui_t", 0.0) < 0.5:
+            return
+        self._last_telemetry_ui_t = now
+
+        capture_fps = float(telemetry.get("capture_fps", 0.0) or 0.0)
+        inference_fps = float(telemetry.get("inference_fps", 0.0) or 0.0)
+        latency_ms = float(telemetry.get("latency_ms", 0.0) or 0.0)
         self.fps_capture.setText(f"{capture_fps:.1f}")
         self.fps_inference.setText(f"{inference_fps:.1f}")
         self.latency.setText(f"{latency_ms:.1f} ms")
@@ -2319,10 +2471,6 @@ class MainWindow(QMainWindow):
         self.vram.setText(f"{telemetry.get('vram_mb', 0.0):.0f} MB")
         self.temperature.setText(f"{telemetry.get('soc_temp_c', 0.0):.1f} °C")
         self.health_bar.setValue(min(100, max(0, 100 - int(latency_ms))))
-        if hasattr(self, "fps_capture_spark"):
-            self.fps_capture_spark.push(capture_fps)
-            self.fps_inference_spark.push(inference_fps)
-            self.latency_spark.push(latency_ms)
         self._refresh_live_summary()
         try:
             self._telemetry_log.maybe_record(self._latest_telemetry)

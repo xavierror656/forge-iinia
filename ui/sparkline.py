@@ -28,15 +28,19 @@ class Sparkline(QWidget):
         self.update()
 
     def paintEvent(self, _event) -> None:  # noqa: N802
+        from PyQt6.QtWidgets import QApplication
+        from ui.theme import tokens as _tok
+        _theme = (QApplication.instance().property("uiTheme") or "dark") if QApplication.instance() else "dark"
+        t = _tok(_theme)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = self.rect().adjusted(2, 2, -2, -2)
-        painter.fillRect(rect, QColor("#0f1115"))
-        painter.setPen(QPen(QColor("#1d2330"), 1))
+        painter.fillRect(rect, QColor(t["bg"]))
+        painter.setPen(QPen(QColor(t["border"]), 1))
         painter.drawRect(rect)
 
         if len(self._values) < 2:
-            painter.setPen(QPen(QColor("#3a4452")))
+            painter.setPen(QPen(QColor(t["muted2"])))
             painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), "—")
             painter.end()
             return
@@ -68,6 +72,6 @@ class Sparkline(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPolyline(QPolygonF(points))
 
-        painter.setPen(QPen(QColor("#9fb2c8")))
+        painter.setPen(QPen(QColor(t["muted"])))
         painter.drawText(rect.adjusted(4, 0, -4, 0), int(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight), f"{values[-1]:.1f}")
         painter.end()

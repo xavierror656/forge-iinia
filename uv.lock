@@ -416,6 +416,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "gpiozero" },
+    { name = "nodegraphqt" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "opencv-python" },
@@ -441,6 +442,7 @@ dev = [
 requires-dist = [
     { name = "gpiozero", specifier = ">=2.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
+    { name = "nodegraphqt", specifier = ">=0.6.44" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "opencv-python", specifier = ">=4.10" },
     { name = "paho-mqtt", specifier = ">=2.1.0" },
@@ -1076,6 +1078,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/24/bf/d1bda4f6168e0b2e9e5958945e01910052158313224ada5ce1fb2e1113b8/nodeenv-1.10.0.tar.gz", hash = "sha256:996c191ad80897d076bdfba80a41994c2b47c68e224c542b48feba42ba00f8bb", size = 55611, upload-time = "2025-12-20T14:08:54.006Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/88/b2/d0896bdcdc8d28a7fc5717c305f1a861c26e18c05047949fb371034d98bd/nodeenv-1.10.0-py2.py3-none-any.whl", hash = "sha256:5bb13e3eed2923615535339b3c620e76779af4cb4c6a90deccc9e36b274d3827", size = 23438, upload-time = "2025-12-20T14:08:52.782Z" },
+]
+
+[[package]]
+name = "nodegraphqt"
+version = "0.6.44"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "qt-py" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/57/23/4966003f70f6bc18cba62ae7b484d84cb0cb669c6e5992778671c1ea758a/nodegraphqt-0.6.44.tar.gz", hash = "sha256:d905a8c100da5f45dc403d2701c09ed2e4c13bcdc3a21b0da5e8f0f5ceedaeaa", size = 116669, upload-time = "2026-02-04T22:53:18.655Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c5/d7/deb8ddfbe1df5710407acb4f4d4e679845841c78924cd67ee3a4e428b418/nodegraphqt-0.6.44-py3-none-any.whl", hash = "sha256:2ea4bcef7ac73827bd52d7c1bd9120e886cfb8395b187f3dd471244790dd8cb3", size = 141312, upload-time = "2026-02-04T22:53:16.909Z" },
 ]
 
 [[package]]
@@ -1801,6 +1815,18 @@ wheels = [
 ]
 
 [[package]]
+name = "qt-py"
+version = "2.0.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "types-pyside6" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c6/b4/f6cc8c7e4041c4b3a2f49808233297e547fe97073cf6824f4394960d416e/qt_py-2.0.4.tar.gz", hash = "sha256:8a55a8b588a67d1396f003f044907267ef20fb42840d148c7eb01d71c580ccf3", size = 63939, upload-time = "2026-03-28T00:43:51.7Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bd/a7/4b405267a122daa482ed79a6bcf00e82f07a844871f3a36b8bc85570120f/qt_py-2.0.4-py3-none-any.whl", hash = "sha256:4a619a808636a90a4ccc77e6749f294f7ababba5cb45942d6d072420d2ed4cac", size = 46140, upload-time = "2026-03-28T00:43:50.004Z" },
+]
+
+[[package]]
 name = "requests"
 version = "2.33.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2250,6 +2276,14 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/df/3d/9e7eee57b37c80cec63322c0231bb6da3cfe535a91d7a4d64896fcb89357/triton-3.6.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a17a5d5985f0ac494ed8a8e54568f092f7057ef60e1b0fa09d3fd1512064e803", size = 188273063, upload-time = "2026-01-20T16:01:07.278Z" },
     { url = "https://files.pythonhosted.org/packages/48/db/56ee649cab5eaff4757541325aca81f52d02d4a7cd3506776cad2451e060/triton-3.6.0-cp314-cp314t-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0b3a97e8ed304dfa9bd23bb41ca04cdf6b2e617d5e782a8653d616037a5d537d", size = 176274804, upload-time = "2026-01-20T16:16:31.528Z" },
     { url = "https://files.pythonhosted.org/packages/f6/56/6113c23ff46c00aae423333eb58b3e60bdfe9179d542781955a5e1514cb3/triton-3.6.0-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:46bd1c1af4b6704e554cad2eeb3b0a6513a980d470ccfa63189737340c7746a7", size = 188397994, upload-time = "2026-01-20T16:01:14.236Z" },
+]
+
+[[package]]
+name = "types-pyside6"
+version = "6.10.1.1"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/dd/89/ebea68732d692df588cc3f5308bd341c0431f4acf70f39e3680089a83222/types_pyside6-6.10.1.1-py2.py3-none-any.whl", hash = "sha256:30ff49550c8f40e0606d70f9fbcf1f0c4b688d896df38f4f6a6912c231cbfa16", size = 590032, upload-time = "2026-01-30T15:53:10.556Z" },
 ]
 
 [[package]]
